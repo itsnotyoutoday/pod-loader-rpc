@@ -29,7 +29,8 @@ you can run from any subdirectory of it.
     PODH_RUNPOD_FALLBACK_TO_GPU   opt-in; roughly 12x the price
 
     # ---- cost ----------------------------------------------------------
-    BUDGET_MIN         hard kill, enforced from outside the pod
+    MAX_COST_HR        THE budget: most you will pay per hour while placing
+    MAX_LIFETIME_MIN   lifetime cap for a pod that never reports liveness
     QUEUE_DEADLINE_MIN stop waiting for capacity after this
 
     # ---- storage -------------------------------------------------------
@@ -135,7 +136,16 @@ class LaunchConfig:
     max_cost_hr: float = 0.0            # 0 = no ceiling. Refuses, does not just warn.
 
     # -- cost --------------------------------------------------------------------------
-    budget_min: float = 60.0            # the reaper's hard kill
+    #: THE budget: the most you will pay per hour. Placement walks shapes and refuses any
+    #: slot above this, releasing one immediately if the provider creates it anyway. This
+    #: is what "budget" means — a price ceiling for finding a pod, not a time limit.
+    #: (declared above as max_cost_hr)
+
+    #: A last-resort lifetime cap, and NOT a budget despite once being called one. It
+    #: applies only to a pod that never reports liveness: pod-control judges a reporting
+    #: pod by whether it is still making progress, so a healthy job may run for days. This
+    #: exists so a pod that reports nothing at all cannot be immortal.
+    max_lifetime_min: float = 1440.0
     queue_deadline_min: float = 0.0     # give up waiting for capacity after this
 
     # -- storage -----------------------------------------------------------------------
@@ -221,7 +231,7 @@ def load(path: str | Path | None = None) -> LaunchConfig:
                 or LaunchConfig.clouds,
         fallback_to_gpu=g("PODH_RUNPOD_FALLBACK_TO_GPU", "false").lower() in ("1","true","yes"),
         max_cost_hr=num("MAX_COST_HR", 0.0),
-        budget_min=num("BUDGET_MIN", 60.0),
+        max_lifetime_min=num("MAX_LIFETIME_MIN", num("BUDGET_MIN", 1440.0)),
         queue_deadline_min=num("QUEUE_DEADLINE_MIN", 0.0),
         vcpu=num("VCPU", 8),
         disk_gb=num("DISK_GB", 30),
@@ -276,7 +286,7 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
         "PODH_RUN_PREFIX": f"runs/{job_id}",
         "PODH_WRITE_PREFIXES": f"runs/{job_id},_tmp/",
         "PODH_MOUNT_KIND": "volume" if cfg.runpod_volume else "object",
-        "PODH_MAX_LIFE_SEC": str(int(cfg.budget_min * 60)),
+        "PODH_MAX_LIFE_SEC": str(int(cfg.max_lifetime_min * 60)),
         "PODH_MAX_IDLE_SEC": "0",
     }
     # The pod reports to pod-control only if it was told where, with what token, and
@@ -325,8 +335,9 @@ def check(cfg: LaunchConfig) -> list[str]:
         problems.append(f"JOB_SPEC not found: {cfg.job_spec}")
     if cfg.workload and not (Path(cfg.workload).expanduser() / "code").is_dir():
         problems.append(f"WORKLOAD has no code/ directory: {cfg.workload}")
-    if cfg.budget_min <= 0:
-        problems.append("BUDGET_MIN must be positive — it is the only hard cost ceiling")
+    if cfg.max_lifetime_min <= 0:
+        problems.append("MAX_LIFETIME_MIN must be positive — a pod that reports "
+                        "nothing must not be immortal")
     if cfg.control_url and not cfg.control_url.startswith(("http://", "https://")):
         problems.append(f"PODH_CONTROL_URL={cfg.control_url!r} needs a scheme (https://…)")
     if cfg.control_url and not cfg.queue_deadline_min:

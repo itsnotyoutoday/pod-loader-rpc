@@ -16,11 +16,11 @@ class RunPodLoader(BaseLoader):
             RunPodAPI()
         except Exception as e:
             problems.append(f"RunPod API unavailable: {str(e)[:90]}")
-        if getattr(cfg, "budget_min", 0) <= 0:
+        if getattr(cfg, "max_lifetime_min", 0) <= 0:
             problems.append(
-                "BUDGET_MIN must be positive. It is the ONLY hard ceiling: an in-pod "
-                "timeout cannot terminate a RunPod pod — runpodctl from inside returns "
-                "Unauthorized, so it detects the overrun and keeps billing.")
+                "MAX_LIFETIME_MIN must be positive. An in-pod timeout cannot terminate a "
+                "RunPod pod — runpodctl from inside returns Unauthorized — so a pod that "
+                "reports no liveness and has no lifetime cap can never be stopped."),
         return problems
 
     def plan(self, cfg) -> str:
@@ -71,7 +71,7 @@ class RunPodLoader(BaseLoader):
 
         # Journalled BEFORE anything else can fail, so a pod whose launcher dies is still
         # discoverable. A pod nobody journaled is a pod nobody can find.
-        deadline = time.time() + cfg.budget_min * 60
+        deadline = time.time() + cfg.max_lifetime_min * 60
         reaper.journal(pod_id, f"job-{job_id}", cost, deadline)
         _arm_deadline(pod_id, deadline, cost)
         _register_with_control(cfg, pod_id, deadline, cost, job_id)
@@ -80,7 +80,7 @@ class RunPodLoader(BaseLoader):
             target=self.name, job_id=job_id, handle=pod_id,
             endpoint=f"https://{pod_id}-8000.proxy.runpod.net", cost_hr=cost,
             detail={"placement": f"{used.get('cloud_type','')}/{shape}",
-                    "budget_min": cfg.budget_min,
+                    "max_lifetime_min": cfg.max_lifetime_min,
                     "datacenter": vol.datacenter if vol else None})
 
     def stop(self, handle: str) -> dict:
@@ -178,7 +178,7 @@ def _register_with_control(cfg, pod_id: str, deadline_ts: float, cost_hr: float,
         ctx = _pinned_context(cfg)
         with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
             _verify_pin(r, ctx)
-        print(f"  registered with pod-control (deadline in {cfg.budget_min:.0f}min)",
+        print(f"  registered with pod-control (lifetime cap {cfg.max_lifetime_min:.0f}min)",
               flush=True)
     except Exception as e:
         # Loud, not fatal. The local thread and the journal still hold, but the operator

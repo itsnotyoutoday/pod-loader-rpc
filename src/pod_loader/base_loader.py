@@ -222,7 +222,7 @@ class BaseLoader:
             "create": self.create_kwargs(cfg, env=env),
             "capacity": launchfile.capacity_kwargs(cfg),
             "max_cost_hr": cfg.max_cost_hr,
-            "budget_min": cfg.budget_min,
+            "budget_min": cfg.max_lifetime_min,
             "queue_deadline_min": cfg.queue_deadline_min,
             "idempotency_key": cfg.idempotency_key or job_id,
         }
