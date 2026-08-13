@@ -37,8 +37,9 @@ class RunPodLoader(BaseLoader):
 
     def create_kwargs(self, cfg, *, env: dict) -> dict:
         from . import volume
-        kw = {"image": cfg.image, "container_disk_gb": cfg.disk_gb,
-              "vcpu_count": cfg.vcpu, "ports": ["8000/http"], "env": env}
+        kw = {"name": "queued-job", "image": cfg.image,
+              "container_disk_gb": cfg.disk_gb, "vcpu_count": cfg.vcpu,
+              "ports": ["8000/http"], "env": env}
         vol = volume.load(cfg.runpod_volume or None)
         if vol:
             kw.update(vol.create_kwargs())
@@ -48,8 +49,11 @@ class RunPodLoader(BaseLoader):
         from .. import launchfile
         from . import reaper, volume
 
-        create = {"image": cfg.image, "container_disk_gb": cfg.disk_gb,
-                  "vcpu_count": cfg.vcpu, "ports": ["8000/http"], "env": env}
+        # The name is required by the API and is also how the reaper's sweep recognises
+        # its own work, so it is set here rather than left to the caller.
+        create = {"name": f"job-{job_id}", "image": cfg.image,
+                  "container_disk_gb": cfg.disk_gb, "vcpu_count": cfg.vcpu,
+                  "ports": ["8000/http"], "env": env}
         vol = volume.load(cfg.runpod_volume or None)
         if vol:
             vol.require_provider("runpod")
@@ -67,8 +71,10 @@ class RunPodLoader(BaseLoader):
 
         # Journalled BEFORE anything else can fail, so a pod whose launcher dies is still
         # discoverable. A pod nobody journaled is a pod nobody can find.
-        reaper.journal(pod_id, f"job-{job_id}", cost,
-                       time.time() + cfg.budget_min * 60)
+        deadline = time.time() + cfg.budget_min * 60
+        reaper.journal(pod_id, f"job-{job_id}", cost, deadline)
+        _arm_deadline(pod_id, deadline, cost)
+        _register_with_control(cfg, pod_id, deadline, cost, job_id)
         shape = (used.get("cpu_flavor_ids") or used.get("gpu_type_ids") or ["?"])[0]
         return Running(
             target=self.name, job_id=job_id, handle=pod_id,
@@ -113,3 +119,67 @@ def _age_sec(pod: dict) -> float:
             except ValueError:
                 continue
     return 0.0
+
+
+def _arm_deadline(pod_id: str, deadline_ts: float, cost_hr: float) -> None:
+    """A daemon thread that terminates this pod when its budget runs out.
+
+    `runctl launch` returns as soon as the pod is created, so there is no context manager
+    holding it — which meant, briefly, that a pod created this way had NO automatic
+    termination at all. That is the exact failure this project keeps circling: an in-pod
+    timeout cannot terminate a RunPod pod, so if nothing out here is counting, nothing is.
+
+    A daemon thread dies with the shell, so this alone is not sufficient — it covers the
+    common case where the terminal stays open. `_register_with_control` covers the case
+    where it does not, and `reaper.journal` covers both by leaving a trail a later
+    `sweep()` can act on. Three partial guarantees that fail in different ways.
+    """
+    import threading
+
+    def kill():
+        remaining = deadline_ts - time.time()
+        if remaining > 0:
+            time.sleep(remaining)
+        try:
+            from .api import RunPodAPI
+            RunPodAPI().terminate(pod_id)
+            print(f"\n  [deadline] terminated {pod_id} — budget exhausted "
+                  f"(${cost_hr}/hr)", flush=True)
+        except Exception as e:
+            print(f"\n  [deadline] COULD NOT terminate {pod_id}: {e}\n"
+                  f"  Kill it manually: python runctl.py kill --pod {pod_id}", flush=True)
+
+    threading.Thread(target=kill, daemon=True, name=f"deadline-{pod_id}").start()
+
+
+def _register_with_control(cfg, pod_id: str, deadline_ts: float, cost_hr: float,
+                           job_id: str) -> None:
+    """Hand the deadline to pod-control, which outlives this shell.
+
+    Registered AFTER creation here, which leaves a window where the pod exists and
+    pod-control has not heard of it. That window is why the sweep has a grace period for
+    unregistered pods — without it, this pod would be reaped as an orphan seconds after
+    being created.
+    """
+    if not getattr(cfg, "control_url", ""):
+        return
+    import json
+    import urllib.request
+
+    from ..base_loader import _control_token
+    try:
+        req = urllib.request.Request(
+            cfg.control_url.rstrip("/") + "/v1/register",
+            data=json.dumps({"pod_id": pod_id, "provider": "runpod",
+                             "deadline_ts": deadline_ts, "cost_hr": cost_hr,
+                             "job_id": job_id, "name": f"job-{job_id}"}).encode(),
+            headers={"Content-Type": "application/json",
+                     "X-Podh-Token": _control_token(cfg)}, method="POST")
+        urllib.request.urlopen(req, timeout=15)
+        print(f"  registered with pod-control (deadline in {cfg.budget_min:.0f}min)",
+              flush=True)
+    except Exception as e:
+        # Loud, not fatal. The local thread and the journal still hold, but the operator
+        # should know the durable guarantee is the one that failed.
+        print(f"  ⚠️  could not register with pod-control: {type(e).__name__}. "
+              f"The deadline is now only as good as this shell staying open.", flush=True)
