@@ -154,6 +154,11 @@ class LaunchConfig:
     volume_keyfile: str = ""            # provider-local volume gateway
     runpod_volume: str = ""             # RunPod only; PINS the datacenter
     cache: str = "persistent"           # persistent | ephemeral | off
+    #: Store profiles whose credentials this job needs ON THE POD. Empty by default: a pod
+    #: reading a mounted volume needs no credentials at all, and the fewer places a key
+    #: exists the fewer places it leaks from. Naming a profile here is an explicit
+    #: statement that this job talks to that store directly.
+    forward_stores: tuple = ()
     local_workspace: str = "./work"     # TARGET=docker mounts this as /workspace
 
     #: Where pod-control lives, if it is running. With it set, a launch is SUBMITTED there
@@ -167,6 +172,9 @@ class LaunchConfig:
     #: of any certificate any CA was willing to sign.
     control_fingerprint: str = ""
     idempotency_key: str = ""
+    #: Usually left empty and minted per job. Set it only when something outside
+    #: this launch needs to poll the pod and cannot be told the minted value.
+    api_token: str = ""
 
     job_spec: str = ""
     workload: str = ""
@@ -239,11 +247,14 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         store_keyfile=g("STORE_KEYFILE"),
         volume_keyfile=g("VOLUME_KEYFILE"),
         cache=g("CACHE", "persistent").lower(),
+        forward_stores=tuple(x.strip().lower()
+                             for x in g("FORWARD_STORES").split(",") if x.strip()),
         local_workspace=g("LOCAL_WORKSPACE", "./work"),
         control_url=g("PODH_CONTROL_URL").rstrip("/"),
         control_token_file=g("PODH_CONTROL_TOKEN_FILE"),
         control_fingerprint=g("PODH_CONTROL_FINGERPRINT"),
         idempotency_key=g("IDEMPOTENCY_KEY"),
+        api_token=g("PODH_API_TOKEN"),
         runpod_volume=g("PODH_RUNPOD_VOLUME"),
         job_spec=g("JOB_SPEC"),
         workload=g("WORKLOAD"),
@@ -269,6 +280,32 @@ def apply_to_environ(cfg: LaunchConfig) -> None:
         os.environ["PODH_S3_KEY_FILE"] = str(Path(cfg.store_keyfile).expanduser())
 
 
+def _minted_token(job_id: str) -> str:
+    """A deterministic per-job token.
+
+    Deterministic so a launcher that has the job id can reconstruct it and poll the pod
+    without a side channel; salted with the machine's own secret so knowing a job id is
+    not enough to derive it.
+    """
+    import hashlib
+    import os
+    from pathlib import Path
+
+    salt = os.environ.get("PODH_TOKEN_SALT", "")
+    if not salt:
+        p = Path.home() / ".podh-token-salt"
+        if not p.is_file():
+            p.write_text(os.urandom(24).hex())
+            p.chmod(0o600)
+        salt = p.read_text().strip()
+    return hashlib.sha256(f"{salt}:{job_id}".encode()).hexdigest()[:32]
+
+
+def token_for(job_id: str) -> str:
+    """The token a given job's pod is using, for polling it."""
+    return _minted_token(job_id)
+
+
 def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "",
             workspace: str = "/workspace") -> dict:
     """Compose the environment the pod is given.
@@ -277,7 +314,14 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
     one place — and checked against the harness contract, so a missing one fails while
     composing instead of when the pod refuses to boot.
     """
+    # Without a token the harness's Caddy rejects every request, so the pod runs the job
+    # perfectly and is completely unobservable. Generated per job rather than configured,
+    # because a token that lives in a launch file is a token that gets committed, and one
+    # shared across pods means compromising any pod compromises them all.
+    api_token = cfg.api_token or _minted_token(job_id)
+
     env = {
+        "PODH_API_TOKEN": api_token,
         "PODH_MODE": "batch" if cfg.autorun else "serve",
         "PODH_WORKSPACE": workspace,
         "PODH_JOB_ID": job_id,
@@ -297,6 +341,25 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
         env["PODH_CONTROL_URL"] = cfg.control_url
         env["PODH_CONTROL_TOKEN"] = _control_token(cfg)
         env["PODH_CONTROL_FINGERPRINT"] = cfg.control_fingerprint
+
+    # Resolve each named profile HERE and forward the resolved values, never a key file
+    # path — the pod has no key files and must not be given one. Per-profile prefixes so a
+    # job handed two stores can still tell them apart.
+    for prof in cfg.forward_stores:
+        from .objectstore import resolve_config
+        c = resolve_config(prof)
+        if c is None:
+            continue
+        pre = f"PODH_S3_{prof.upper()}_"
+        env.update({pre + "BUCKET": c.bucket, pre + "ENDPOINT": c.endpoint_url,
+                    pre + "ACCESS": c.access_key, pre + "SECRET": c.secret_key,
+                    pre + "REGION": c.region})
+        # Also unprefixed, so a workload that just calls get_storage() with no profile
+        # gets the first store it was granted rather than nothing.
+        if prof == cfg.forward_stores[0]:
+            env.update({"PODH_S3_BUCKET": c.bucket, "PODH_S3_ENDPOINT": c.endpoint_url,
+                        "PODH_S3_ACCESS": c.access_key, "PODH_S3_SECRET": c.secret_key,
+                        "PODH_S3_REGION": c.region, "PODH_S3_PROFILE": prof})
 
     if cfg.cache == "off":
         env["PODH_CACHE_DISABLED"] = "1"
