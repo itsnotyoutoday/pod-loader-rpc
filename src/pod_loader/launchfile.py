@@ -125,7 +125,7 @@ class LaunchConfig:
     target: str = "runpod"              # runpod | docker | local
     image: str = "ghcr.io/itsnotyoutoday/pod-harness:latest"
     vcpu: int = 8
-    disk_gb: int = 30
+    disk_gb: int = 20
 
     # -- capacity, in priority order ---------------------------------------------------
     compute: str = "CPU"                # CPU | GPU
@@ -242,7 +242,7 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         max_lifetime_min=num("MAX_LIFETIME_MIN", num("BUDGET_MIN", 1440.0)),
         queue_deadline_min=num("QUEUE_DEADLINE_MIN", 0.0),
         vcpu=num("VCPU", 8),
-        disk_gb=num("DISK_GB", 30),
+        disk_gb=num("DISK_GB", 20),
         store=g("STORE").lower(),
         store_keyfile=g("STORE_KEYFILE"),
         volume_keyfile=g("VOLUME_KEYFILE"),
@@ -408,6 +408,12 @@ def check(cfg: LaunchConfig) -> list[str]:
             "PODH_CONTROL_URL is set with no QUEUE_DEADLINE_MIN. A job queued at 6pm that "
             "finally launches at 3am is a surprise you pay for — unattended launching "
             "without an expiry is how you find a bill in the morning.")
+    # Caught here rather than as a provider 500 that a queue then retries forever.
+    if cfg.disk_gb > 20:
+        problems.append(
+            f"DISK_GB={cfg.disk_gb} exceeds the 20 GB container-disk cap RunPod enforces. "
+            f"The provider rejects this outright, and a queue cannot wait its way out of "
+            f"a rejected request.")
     if cfg.compute not in ("CPU", "GPU"):
         problems.append(f"COMPUTE={cfg.compute!r} is not CPU or GPU")
     if cfg.cache not in ("persistent", "ephemeral", "off"):
