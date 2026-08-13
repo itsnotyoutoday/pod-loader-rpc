@@ -42,6 +42,12 @@ you can run from any subdirectory of it.
     # ---- the job -------------------------------------------------------
     JOB_SPEC  WORKLOAD  AUTORUN
 
+    # ---- optional: hand off to pod-control -----------------------------
+    PODH_CONTROL_URL   https://control.example.com:8787
+                       When set, the launch is SUBMITTED there and queues until
+                       capacity exists, instead of being provisioned from here.
+                       Requires QUEUE_DEADLINE_MIN.
+
     # ---- anything else the workload wants ------------------------------
     ENV_LINGUA_MFA_ACOUSTIC = english_us_arpa
 
@@ -140,6 +146,12 @@ class LaunchConfig:
     cache: str = "persistent"           # persistent | ephemeral | off
     local_workspace: str = "./work"     # TARGET=docker mounts this as /workspace
 
+    #: Where pod-control lives, if it is running. With it set, a launch is SUBMITTED there
+    #: and the queue, the placement walk and the deadline all move off this machine.
+    #: Without it, the loader provisions directly exactly as before — this service must be
+    #: an upgrade, never a dependency.
+    control_url: str = ""
+
     job_spec: str = ""
     workload: str = ""
     autorun: bool = True
@@ -212,6 +224,7 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         volume_keyfile=g("VOLUME_KEYFILE"),
         cache=g("CACHE", "persistent").lower(),
         local_workspace=g("LOCAL_WORKSPACE", "./work"),
+        control_url=g("PODH_CONTROL_URL").rstrip("/"),
         runpod_volume=g("PODH_RUNPOD_VOLUME"),
         job_spec=g("JOB_SPEC"),
         workload=g("WORKLOAD"),
@@ -296,6 +309,13 @@ def check(cfg: LaunchConfig) -> list[str]:
         problems.append(f"WORKLOAD has no code/ directory: {cfg.workload}")
     if cfg.budget_min <= 0:
         problems.append("BUDGET_MIN must be positive — it is the only hard cost ceiling")
+    if cfg.control_url and not cfg.control_url.startswith(("http://", "https://")):
+        problems.append(f"PODH_CONTROL_URL={cfg.control_url!r} needs a scheme (https://…)")
+    if cfg.control_url and not cfg.queue_deadline_min:
+        problems.append(
+            "PODH_CONTROL_URL is set with no QUEUE_DEADLINE_MIN. A job queued at 6pm that "
+            "finally launches at 3am is a surprise you pay for — unattended launching "
+            "without an expiry is how you find a bill in the morning.")
     if cfg.compute not in ("CPU", "GPU"):
         problems.append(f"COMPUTE={cfg.compute!r} is not CPU or GPU")
     if cfg.cache not in ("persistent", "ephemeral", "off"):
@@ -359,6 +379,11 @@ CACHE             = persistent             # persistent | ephemeral | off
 JOB_SPEC          = jobs/my-job.json
 WORKLOAD          = ../my-workload         # published before launch
 AUTORUN           = true
+
+# ---- optional: hand off to pod-control ---------------------------------------
+# With this set, `runctl launch` submits and returns; the queue, the placement walk
+# and the deadline move off this machine. Without it, nothing changes.
+# PODH_CONTROL_URL = https://control.example.com:8787
 
 # ---- forwarded to the pod with ENV_ stripped ---------------------------------
 # ENV_LINGUA_MFA_ACOUSTIC = english_us_arpa
