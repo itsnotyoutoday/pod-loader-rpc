@@ -284,6 +284,21 @@ class BaseLoader:
 #: this line is unchanged, because they all speak the same /v1 to the same harness image.
 #: That portability is the reason the harness shares no code with this package and the two
 #: agree only on a contract.
+def control_pod_token(cfg, job_id: str) -> str:
+    """The job-scoped token pod-control will accept from this pod.
+
+    Derived identically on both sides (HMAC of the control secret over the job id), so no
+    round trip is needed at launch and no credential is ever stored anywhere.
+    """
+    import hashlib
+    import hmac
+    master = _control_token(cfg)
+    if not master:
+        return ""
+    return hmac.new(master.encode(), f"pod:{job_id}".encode(),
+                    hashlib.sha256).hexdigest()[:32]
+
+
 def _pinned_context(cfg):
     """Verify pod-control by pinned certificate, exactly as the pod does.
 

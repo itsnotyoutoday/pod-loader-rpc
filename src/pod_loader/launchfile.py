@@ -337,9 +337,15 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
     # which certificate to expect. All three or none: a heartbeat that cannot verify the
     # endpoint must not send the token at all.
     if cfg.control_url and cfg.control_fingerprint:
-        from .base_loader import _control_token
+        from .base_loader import _control_token, control_pod_token
         env["PODH_CONTROL_URL"] = cfg.control_url
-        env["PODH_CONTROL_TOKEN"] = _control_token(cfg)
+        # The SCOPED token, never the master. A pod holding the master credential could
+        # terminate every other pod, submit work and read the whole queue — an admin key
+        # baked into a machine rented by the minute, in a datacenter we do not own,
+        # running an image anyone can pull. This one says "I am alive" and "I am done"
+        # about its own pod and nothing else.
+        env["PODH_CONTROL_TOKEN"] = control_pod_token(cfg, job_id)
+        env["PODH_CONTROL_JOB_ID"] = job_id
         env["PODH_CONTROL_FINGERPRINT"] = cfg.control_fingerprint
 
     # Resolve each named profile HERE and forward the resolved values, never a key file
