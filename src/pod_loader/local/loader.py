@@ -6,7 +6,7 @@ import signal
 import subprocess
 import sys
 
-from ..base_loader import BaseLoader, Running
+from ..base_loader import BaseLoader, PodInfo, Running
 
 
 class DockerLoader(BaseLoader):
@@ -46,6 +46,25 @@ class DockerLoader(BaseLoader):
     def stop(self, handle: str) -> dict:
         subprocess.run(["docker", "rm", "-f", handle], capture_output=True)
         return {"removed": handle}
+
+    def list_pods(self) -> list[PodInfo]:
+        """Containers this loader started. Filtered by the podjob- name prefix so a sweep
+        can never touch an unrelated container someone else is running."""
+        import time
+        r = subprocess.run(
+            ["docker", "ps", "--filter", "name=podjob-",
+             "--format", "{{.ID}}\t{{.Names}}\t{{.CreatedAt}}"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"docker ps failed: {r.stderr.strip()[:160]}")
+        out = []
+        for line in r.stdout.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            out.append(PodInfo(pod_id=parts[0], name=parts[1], cost_hr=0.0,
+                               age_sec=0.0, target=self.name))
+        return out
 
 
 class DirectLoader(BaseLoader):

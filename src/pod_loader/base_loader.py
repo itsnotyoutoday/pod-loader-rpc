@@ -43,6 +43,29 @@ from pathlib import Path
 
 
 @dataclass
+class PodInfo:
+    """One thing that currently exists and may be costing money."""
+
+    pod_id: str
+    name: str
+    cost_hr: float = 0.0
+    age_sec: float = 0.0
+    target: str = ""
+    running: bool = True
+
+    @property
+    def key(self) -> str:
+        """Target-qualified. Two providers can hand out the same id string, and a
+        collision would mean terminating the wrong machine."""
+        return f"{self.target}:{self.pod_id}"
+
+    def describe(self) -> dict:
+        return {"target": self.target, "pod_id": self.pod_id, "name": self.name,
+                "cost_hr": self.cost_hr, "age_min": round(self.age_sec / 60, 1),
+                "running": self.running}
+
+
+@dataclass
 class Running:
     """A started job, and how to reach it."""
 
@@ -78,6 +101,20 @@ class BaseLoader:
 
     def stop(self, handle: str) -> dict:
         raise NotImplementedError(f"{type(self).__name__} must implement stop()")
+
+    def list_pods(self) -> list[PodInfo]:
+        """Everything this target currently has running.
+
+        Lives here rather than in a watchdog because it is provider-specific knowledge,
+        and provider-specific knowledge belongs in one place. A separate service that
+        reimplemented enumeration would be a second definition of the same API call — the
+        shape of bug this project has already paid for repeatedly.
+
+        MUST raise on failure rather than returning []. An empty list and a failed call
+        are indistinguishable to a caller, and anything that quietly concludes "nothing is
+        running" stops protecting you at the moment it matters most.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot enumerate pods")
 
     def plan(self, cfg) -> str:
         """One line describing what start() would do. Shown by --dry-run."""

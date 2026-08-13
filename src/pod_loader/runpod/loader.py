@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 
-from ..base_loader import BaseLoader, Running
+from ..base_loader import BaseLoader, PodInfo, Running
 
 
 class RunPodLoader(BaseLoader):
@@ -72,3 +72,35 @@ class RunPodLoader(BaseLoader):
         from .api import RunPodAPI
         RunPodAPI().terminate(handle)
         return {"terminated": handle}
+
+    def list_pods(self) -> list[PodInfo]:
+        from .api import RunPodAPI
+        return [PodInfo(pod_id=p["id"], name=p.get("name", ""),
+                        cost_hr=float(p.get("costPerHr") or 0),
+                        age_sec=_age_sec(p), target=self.name,
+                        running=(p.get("desiredStatus") == "RUNNING"))
+                for p in RunPodAPI().pods()]
+
+
+def _age_sec(pod: dict) -> float:
+    """Uptime from whichever timestamp RunPod supplies.
+
+    An unparseable date reads as age ZERO, never as old. A watcher protects young pods
+    with a grace period, so "unknown" must land on the side that does not terminate
+    somebody's running job over a date format.
+    """
+    import datetime as dt
+    for key in ("lastStartedAt", "createdAt"):
+        raw = (pod.get(key) or "").strip()
+        if not raw:
+            continue
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f %z %Z", "%Y-%m-%d %H:%M:%S.%f %z",
+                    "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                t = dt.datetime.strptime(raw, fmt)
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=dt.timezone.utc)
+                return max(0.0, (dt.datetime.now(dt.timezone.utc) - t).total_seconds())
+            except ValueError:
+                continue
+    return 0.0
