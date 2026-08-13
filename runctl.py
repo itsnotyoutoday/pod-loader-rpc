@@ -336,16 +336,88 @@ def cmd_watch(a) -> int:
 
 
 def cmd_launch(a) -> int:
-    """Upload code + instruction file to the volume and provision a pod to run it."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from pod_loader.batch_pod import launch, sync_code
+    """Publish code, stage the spec, provision a pod, and run the job.
 
-    if not a.no_sync:
-        r = sync_code()
-        print(f"  code synced: {r['files']} files, {r['kilobytes']} KB")
-    L = launch(a.spec)
-    print(f"\n  ✓ pod {L.pod_id}  job={L.job_id}  ${L.cost_per_hr}/hr")
-    print(f"  watch: python runctl.py watch --job {L.job_id}")
+    Driven by `.pod.env` in the launch directory. It used to call a sync_code() that
+    walked the pre-split monolith's folder names, so after the repo split it published
+    nothing relevant and the pod failed with ModuleNotFoundError — everything below is
+    what a launch actually needs, in one place.
+    """
+    import json
+    import time
+
+    from pod_loader import contract, launchfile, reaper, sync, volume
+    from pod_loader.objectstore import get_storage
+
+    cfg = launchfile.load(a.env_file)
+    print(f"  launch config: {cfg.source}")
+    problems = launchfile.check(cfg)
+    if problems:
+        print("\n  ✗ launch config is not usable:")
+        for pr in problems:
+            print(f"      {pr}")
+        return 2
+    launchfile.apply_to_environ(cfg)
+
+    spec_path = a.spec or cfg.job_spec
+    if not spec_path:
+        print("  ✗ no job spec: pass --spec, or set JOB_SPEC in .pod.env")
+        return 2
+    spec = json.loads(Path(spec_path).read_text())
+
+    # Validate BEFORE spending anything. A typo caught here costs a millisecond; the same
+    # typo on a pod costs the image pull, the boot, and the minutes until someone notices.
+    bad = contract.validate_spec(spec)
+    if bad:
+        print("\n  ✗ this spec would be rejected by the harness:")
+        for b in bad:
+            print(f"      {b}")
+        return 2
+
+    code_root = ""
+    if cfg.workload and not a.no_sync:
+        r = sync.publish(cfg.workload)
+        code_root = r["root"]
+        print(f"  code: {r['files']} files → {code_root}"
+              + ("   (MUTABLE dev path — commit to pin it)" if r["mutable"] else ""))
+
+    job_id = a.job_id or f"job{int(time.time())}"
+    if code_root:
+        spec["code"] = {"root": code_root, "rev": code_root.rsplit("/", 1)[-1]}
+    st = get_storage(cfg.store or None)
+    spec_key = f"runs/{job_id}/spec.json"
+    st.client.put_object(Bucket=st.require().bucket, Key=spec_key,
+                         Body=json.dumps(spec).encode())
+    print(f"  spec: {spec_key}")
+
+    env = launchfile.pod_env(cfg, job_id=job_id, spec_key=spec_key, code_root=code_root)
+    missing = contract.check_env(env)
+    if missing:
+        print("\n  ✗ the harness contract requires variables this launch does not set:")
+        for m in missing:
+            print(f"      {m}")
+        return 2
+
+    create = {"image": cfg.image, "container_disk_gb": cfg.disk_gb,
+              "vcpu_count": cfg.vcpu, "ports": ["8000/http"], "env": env}
+    vol = volume.load(cfg.runpod_volume or None)
+    if vol:
+        vol.require_provider("runpod")
+        create.update(vol.create_kwargs())
+        print(f"  volume: {vol.volume_id} in {vol.datacenter} "
+              f"(pins compute to that datacenter)")
+
+    if a.dry_run:
+        print("\n  --dry-run: everything validated, nothing provisioned")
+        print(f"  would try: {len(list(reaper.placements(**{k: v for k, v in launchfile.capacity_kwargs(cfg).items() if k != 'max_cost_hr'})))} placements")
+        return 0
+
+    with reaper.pod(create, budget_min=cfg.budget_min, name=f"job-{job_id}",
+                    capacity=launchfile.capacity_kwargs(cfg)) as pod:
+        pod_id = pod["pod_id"] if isinstance(pod, dict) else pod
+        print(f"\n  ✓ pod {pod_id}  job={job_id}")
+        print(f"  watch:  python runctl.py watch --job {job_id}")
+        print(f"  status: python runctl.py poll  --job {job_id}")
     return 0
 
 
@@ -445,9 +517,14 @@ def main() -> int:
     w.add_argument("--log", action="store_true", help="also print the raw log tail")
     w.set_defaults(fn=cmd_watch)
 
-    la = sub.add_parser("launch", help="sync code + spec to the volume, provision a pod")
-    la.add_argument("--spec", required=True)
-    la.add_argument("--no-sync", action="store_true", help="skip the code upload")
+    la = sub.add_parser("launch",
+                        help="publish code, stage the spec, provision a pod, run the job")
+    la.add_argument("--spec", help="job spec; defaults to JOB_SPEC in .pod.env")
+    la.add_argument("--env-file", help="launch file; defaults to .pod.env found upward")
+    la.add_argument("--job-id", help="override the generated job id")
+    la.add_argument("--no-sync", action="store_true", help="skip publishing the workload")
+    la.add_argument("--dry-run", action="store_true",
+                    help="validate everything and provision nothing")
     la.set_defaults(fn=cmd_launch)
 
     k = sub.add_parser("kill", help="terminate pods (stopping alone still bills)")

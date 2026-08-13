@@ -136,14 +136,16 @@ def load(spec_value: str | None = None, *, enrich: bool = True) -> RunPodVolume 
     found by walking up to $HOME. Returning None is a legitimate outcome — a job reading
     straight from object storage needs no volume, and that is the portable path.
     """
-    raw = spec_value or os.environ.get("RUNPOD_VOLUME", "").strip()
+    raw = (spec_value or os.environ.get("RUNPOD_VOLUME", "")).strip()
+    if raw.startswith("~"):
+        raw = str(Path(raw).expanduser())   # launch files are written by humans
     src = "argument" if spec_value else ("RUNPOD_VOLUME" if raw else "")
 
     if raw and not Path(raw).exists() and re.fullmatch(r"[a-z0-9]{6,32}", raw):
         vol = RunPodVolume(volume_id=raw, source=f"{src} (inline id)")
         return _enrich(vol) if enrich else vol
 
-    path = Path(raw) if raw else _search_up(DEFAULT_FILES)
+    path = Path(raw).expanduser() if raw else _search_up(DEFAULT_FILES)
     if not path or not path.is_file():
         if raw:
             raise VolumeError(

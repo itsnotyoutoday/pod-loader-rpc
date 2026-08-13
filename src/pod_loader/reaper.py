@@ -260,7 +260,8 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
 
 
 @contextmanager
-def pod(create_kwargs: dict, *, budget_min: float = 15.0, name: str | None = None):
+def pod(create_kwargs: dict, *, budget_min: float = 15.0, name: str | None = None,
+        capacity: dict | None = None):
     """Launch a pod that CANNOT outlive its budget.
 
     Termination is attempted from four places, because each covers a failure the others
@@ -279,7 +280,7 @@ def pod(create_kwargs: dict, *, budget_min: float = 15.0, name: str | None = Non
     nm = name or f"{EPHEMERAL_PREFIX}{int(time.time())}"
     create_kwargs = {**create_kwargs, "name": nm}
 
-    p, create_kwargs = create_with_capacity(api, create_kwargs)
+    p, create_kwargs = create_with_capacity(api, create_kwargs, **(capacity or {}))
     pid = p.get("id")
     if not pid:
         raise RuntimeError(f"pod create returned no id: {p}")
