@@ -35,6 +35,15 @@ class RunPodLoader(BaseLoader):
         ceiling = f", refusing anything above ${cfg.max_cost_hr}/hr" if cfg.max_cost_hr else ""
         return f"would try {n} placements{ceiling}"
 
+    def create_kwargs(self, cfg, *, env: dict) -> dict:
+        from . import volume
+        kw = {"image": cfg.image, "container_disk_gb": cfg.disk_gb,
+              "vcpu_count": cfg.vcpu, "ports": ["8000/http"], "env": env}
+        vol = volume.load(cfg.runpod_volume or None)
+        if vol:
+            kw.update(vol.create_kwargs())
+        return kw
+
     def start(self, cfg, *, job_id: str, env: dict, spec_key: str) -> Running:
         from .. import launchfile
         from . import reaper, volume

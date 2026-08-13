@@ -184,10 +184,81 @@ class BaseLoader:
                               "\n".join(f"    {p}" for p in problems) +
                               "\n  Caught here for free.")
 
+        # Hand off to pod-control when one is configured. Everything above this line
+        # already ran, so a submitted job is validated exactly as strictly as a local one
+        # — the control plane inherits a checked spec rather than re-deriving trust.
+        if cfg.control_url:
+            if dry_run:
+                self._say(f"--dry-run: would submit to {cfg.control_url} "
+                          f"(queue deadline {cfg.queue_deadline_min:.0f}min)")
+                return None
+            return self.submit_to_control(cfg, job_id=job_id, env=env, spec_key=spec_key)
+
         if dry_run:
             self._say(f"--dry-run: validated for {self.name}; {self.plan(cfg)}")
             return None
         return self.start(cfg, job_id=job_id, env=env, spec_key=spec_key)
+
+    def submit_to_control(self, cfg, *, job_id: str, env: dict,
+                          spec_key: str) -> Running:
+        """Queue the job with pod-control instead of provisioning it here.
+
+        The queue, the placement walk and the deadline all move off this machine, which is
+        the point: a laptop that sleeps stops being part of the critical path. The job
+        waits there until capacity AND price are acceptable, or until its queue deadline
+        expires.
+        """
+        import json
+        import urllib.error
+        import urllib.request
+
+        from . import launchfile
+
+        body = {
+            "job_id": job_id,
+            "spec_key": spec_key,
+            "target": self.name,
+            "env": env,
+            "create": self.create_kwargs(cfg, env=env),
+            "capacity": launchfile.capacity_kwargs(cfg),
+            "max_cost_hr": cfg.max_cost_hr,
+            "budget_min": cfg.budget_min,
+            "queue_deadline_min": cfg.queue_deadline_min,
+            "idempotency_key": cfg.idempotency_key or job_id,
+        }
+        req = urllib.request.Request(
+            cfg.control_url.rstrip("/") + "/v1/jobs",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "X-Podh-Token": _control_token(cfg)},
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            raise LoaderError(
+                f"pod-control refused the job ({e.code}): "
+                f"{e.read().decode()[:300]}") from None
+        except Exception as e:
+            raise LoaderError(
+                f"cannot reach pod-control at {cfg.control_url}: {type(e).__name__}\n"
+                f"  Unset PODH_CONTROL_URL to provision directly from here instead."
+            ) from None
+
+        self._say(f"queued with pod-control: {out.get('job_id')} "
+                  f"({'already existed' if out.get('existing') else 'new'})")
+        return Running(target=f"control:{self.name}", job_id=out.get("job_id", job_id),
+                       handle=out.get("job_id", job_id), endpoint=cfg.control_url,
+                       detail={"state": out.get("state", "queued"),
+                               "queue_deadline_min": cfg.queue_deadline_min})
+
+    def create_kwargs(self, cfg, *, env: dict) -> dict:
+        """The provider-shaped creation arguments, so pod-control can create it later.
+
+        Built here rather than there because it is provider knowledge, and provider
+        knowledge lives in this package.
+        """
+        return {}
 
     # -- output --------------------------------------------------------------------------
 
@@ -211,6 +282,18 @@ class BaseLoader:
 #: this line is unchanged, because they all speak the same /v1 to the same harness image.
 #: That portability is the reason the harness shares no code with this package and the two
 #: agree only on a contract.
+def _control_token(cfg) -> str:
+    """Shared secret for pod-control. From a file or the environment, never a config
+    value — a launch file sits beside the job and gets committed."""
+    import os
+    from pathlib import Path
+    if getattr(cfg, "control_token_file", ""):
+        p = Path(cfg.control_token_file).expanduser()
+        if p.is_file():
+            return p.read_text().strip()
+    return os.environ.get("PODH_CONTROL_TOKEN", "")
+
+
 def _registry() -> dict:
     from .local.loader import DirectLoader, DockerLoader
     from .runpod.loader import RunPodLoader

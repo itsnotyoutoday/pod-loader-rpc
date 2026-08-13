@@ -151,6 +151,12 @@ class LaunchConfig:
     #: Without it, the loader provisions directly exactly as before — this service must be
     #: an upgrade, never a dependency.
     control_url: str = ""
+    control_token_file: str = ""
+    #: SHA-256 of pod-control's certificate. The control plane has no DNS name,
+    #: so pods verify it by PIN rather than by CA — one exact certificate instead
+    #: of any certificate any CA was willing to sign.
+    control_fingerprint: str = ""
+    idempotency_key: str = ""
 
     job_spec: str = ""
     workload: str = ""
@@ -225,6 +231,9 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         cache=g("CACHE", "persistent").lower(),
         local_workspace=g("LOCAL_WORKSPACE", "./work"),
         control_url=g("PODH_CONTROL_URL").rstrip("/"),
+        control_token_file=g("PODH_CONTROL_TOKEN_FILE"),
+        control_fingerprint=g("PODH_CONTROL_FINGERPRINT"),
+        idempotency_key=g("IDEMPOTENCY_KEY"),
         runpod_volume=g("PODH_RUNPOD_VOLUME"),
         job_spec=g("JOB_SPEC"),
         workload=g("WORKLOAD"),
@@ -270,6 +279,15 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
         "PODH_MAX_LIFE_SEC": str(int(cfg.budget_min * 60)),
         "PODH_MAX_IDLE_SEC": "0",
     }
+    # The pod reports to pod-control only if it was told where, with what token, and
+    # which certificate to expect. All three or none: a heartbeat that cannot verify the
+    # endpoint must not send the token at all.
+    if cfg.control_url and cfg.control_fingerprint:
+        from .base_loader import _control_token
+        env["PODH_CONTROL_URL"] = cfg.control_url
+        env["PODH_CONTROL_TOKEN"] = _control_token(cfg)
+        env["PODH_CONTROL_FINGERPRINT"] = cfg.control_fingerprint
+
     if cfg.cache == "off":
         env["PODH_CACHE_DISABLED"] = "1"
     elif cfg.cache == "persistent":
