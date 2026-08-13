@@ -232,8 +232,10 @@ class BaseLoader:
             headers={"Content-Type": "application/json",
                      "X-Podh-Token": _control_token(cfg)},
             method="POST")
+        ctx = _pinned_context(cfg)
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+                _verify_pin(r, ctx)
                 out = json.loads(r.read())
         except urllib.error.HTTPError as e:
             raise LoaderError(
@@ -282,6 +284,45 @@ class BaseLoader:
 #: this line is unchanged, because they all speak the same /v1 to the same harness image.
 #: That portability is the reason the harness shares no code with this package and the two
 #: agree only on a contract.
+def _pinned_context(cfg):
+    """Verify pod-control by pinned certificate, exactly as the pod does.
+
+    The control plane has no DNS name, so no CA can vouch for it. Both ends are ours, so
+    the client admits ONE certificate rather than trusting every CA to have never
+    mis-issued. Without a pin configured this returns None and verification stays at the
+    default — a self-signed endpoint then simply fails to connect, which is correct: the
+    token must never travel over a connection nobody checked.
+    """
+    import hashlib
+    import ssl
+
+    want = (getattr(cfg, "control_fingerprint", "") or "").replace(":", "").lower()
+    if not want:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx._podh_expected = want
+    return ctx
+
+
+def _verify_pin(response, ctx) -> None:
+    """Confirm the certificate actually served matches the pin, after connecting."""
+    import hashlib
+    import ssl
+
+    if ctx is None:
+        return
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    if sock is None:
+        return
+    got = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+    if got != ctx._podh_expected:
+        raise ssl.SSLError(
+            f"pod-control certificate does not match PODH_CONTROL_FINGERPRINT.\n"
+            f"  expected {ctx._podh_expected[:24]}…\n  got      {got[:24]}…")
+
+
 def _control_token(cfg) -> str:
     """Shared secret for pod-control. From a file or the environment, never a config
     value — a launch file sits beside the job and gets committed."""

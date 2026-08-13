@@ -166,7 +166,7 @@ def _register_with_control(cfg, pod_id: str, deadline_ts: float, cost_hr: float,
     import json
     import urllib.request
 
-    from ..base_loader import _control_token
+    from ..base_loader import _control_token, _pinned_context, _verify_pin
     try:
         req = urllib.request.Request(
             cfg.control_url.rstrip("/") + "/v1/register",
@@ -175,7 +175,9 @@ def _register_with_control(cfg, pod_id: str, deadline_ts: float, cost_hr: float,
                              "job_id": job_id, "name": f"job-{job_id}"}).encode(),
             headers={"Content-Type": "application/json",
                      "X-Podh-Token": _control_token(cfg)}, method="POST")
-        urllib.request.urlopen(req, timeout=15)
+        ctx = _pinned_context(cfg)
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+            _verify_pin(r, ctx)
         print(f"  registered with pod-control (deadline in {cfg.budget_min:.0f}min)",
               flush=True)
     except Exception as e:
