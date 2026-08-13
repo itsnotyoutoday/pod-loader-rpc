@@ -166,13 +166,18 @@ def _register_with_control(cfg, pod_id: str, deadline_ts: float, cost_hr: float,
     import json
     import urllib.request
 
-    from ..base_loader import _control_token, _pinned_context, _verify_pin
+    from ..base_loader import (_control_token, _pinned_context, _verify_pin,
+                               control_pod_token)
     try:
         req = urllib.request.Request(
             cfg.control_url.rstrip("/") + "/v1/register",
+            # The token the pod already has in its environment. Registered AFTER
+            # creation because the environment is fixed at creation, which is before this
+            # pod exists to be registered — the sweep's grace period covers that window.
             data=json.dumps({"pod_id": pod_id, "provider": "runpod",
                              "deadline_ts": deadline_ts, "cost_hr": cost_hr,
-                             "job_id": job_id, "name": f"job-{job_id}"}).encode(),
+                             "job_id": job_id, "name": f"job-{job_id}",
+                             "pod_token": control_pod_token(cfg, job_id)}).encode(),
             headers={"Content-Type": "application/json",
                      "X-Podh-Token": _control_token(cfg)}, method="POST")
         ctx = _pinned_context(cfg)

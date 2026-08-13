@@ -342,6 +342,26 @@ Read the required env set from the contract rather than hardcoding it: when the 
 starts needing a new root, launches fail while composing instead of the pod refusing to
 boot.
 
+### What reaches a pod, and what never does
+
+| | goes to the pod? |
+|---|---|
+| workload code, job spec | yes — as objects it reads |
+| `PODH_API_TOKEN` | yes — minted per job, for its own `/v1` only |
+| `PODH_CONTROL_TOKEN` | yes — a **per-pod** token, good only for "I am alive" / "I am done" |
+| store credentials | only for profiles named in `FORWARD_STORES` |
+| the master control token | **never** |
+| any `*.key` file | **never** |
+| a git credential | **never** |
+
+The master control token can terminate any pod, submit work and read the whole queue.
+Putting it in a machine rented by the minute would make one compromised pod a full
+control-plane compromise. Each pod gets its own random token instead, registered against
+that pod and individually revocable.
+
+Store credentials are resolved here and the **values** are forwarded — the pod never
+receives a key file, and only for stores the job explicitly names.
+
 ### Targets, and adding one
 
 `TARGET` in the launch file picks a class, not a branch:

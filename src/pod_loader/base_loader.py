@@ -284,19 +284,26 @@ class BaseLoader:
 #: this line is unchanged, because they all speak the same /v1 to the same harness image.
 #: That portability is the reason the harness shares no code with this package and the two
 #: agree only on a contract.
-def control_pod_token(cfg, job_id: str) -> str:
-    """The job-scoped token pod-control will accept from this pod.
+#: One token per pod, minted here and registered with pod-control. Cached by job id
+#: because pod_env() and the register call must agree on the value, and they run at
+#: different moments in the launch.
+_MINTED: dict = {}
 
-    Derived identically on both sides (HMAC of the control secret over the job id), so no
-    round trip is needed at launch and no credential is ever stored anywhere.
+
+def control_pod_token(cfg, job_id: str) -> str:
+    """Mint the token this pod will use to report to pod-control.
+
+    Random, not derived. A derived token can only be revoked by rotating the master, which
+    invalidates every pod at once — no use on a fleet where a job may run for days. This
+    one is registered against a single pod and can be revoked alone.
+
+    It authorises exactly two statements: I am alive, I am finished. It cannot submit
+    work, read the queue or touch another pod. The master token never enters a pod.
     """
-    import hashlib
-    import hmac
-    master = _control_token(cfg)
-    if not master:
-        return ""
-    return hmac.new(master.encode(), f"pod:{job_id}".encode(),
-                    hashlib.sha256).hexdigest()[:32]
+    import os
+    if job_id not in _MINTED:
+        _MINTED[job_id] = os.urandom(24).hex()
+    return _MINTED[job_id]
 
 
 def _pinned_context(cfg):
