@@ -336,21 +336,19 @@ def cmd_watch(a) -> int:
 
 
 def cmd_launch(a) -> int:
-    """Publish code, stage the spec, provision a pod, and run the job.
+    """Publish code, stage the spec, and start the job on the configured TARGET.
 
-    Driven by `.pod.env` in the launch directory. It used to call a sync_code() that
-    walked the pre-split monolith's folder names, so after the repo split it published
-    nothing relevant and the pod failed with ModuleNotFoundError — everything below is
-    what a launch actually needs, in one place.
+    Almost nothing happens here: BaseLoader.launch() runs the sequence that is the same
+    for every destination, and the target subclass supplies only preflight/start/stop.
+    This function used to hardcode the RunPod path, which meant TARGET was read from the
+    launch file and then ignored.
     """
     import json
-    import time
 
-    from pod_loader import contract, launchfile, reaper, sync, volume
-    from pod_loader.objectstore import get_storage
+    from pod_loader import base_loader, launchfile
 
     cfg = launchfile.load(a.env_file)
-    print(f"  launch config: {cfg.source}")
+    print(f"  launch config: {cfg.source}   target={cfg.target}")
     problems = launchfile.check(cfg)
     if problems:
         print("\n  ✗ launch config is not usable:")
@@ -361,63 +359,35 @@ def cmd_launch(a) -> int:
 
     spec_path = a.spec or cfg.job_spec
     if not spec_path:
-        print("  ✗ no job spec: pass --spec, or set JOB_SPEC in .pod.env")
+        print("  ✗ no job spec: pass --spec, or set JOB_SPEC in the launch file")
         return 2
     spec = json.loads(Path(spec_path).read_text())
 
-    # Validate BEFORE spending anything. A typo caught here costs a millisecond; the same
-    # typo on a pod costs the image pull, the boot, and the minutes until someone notices.
-    bad = contract.validate_spec(spec)
-    if bad:
-        print("\n  ✗ this spec would be rejected by the harness:")
-        for b in bad:
-            print(f"      {b}")
+    try:
+        loader = base_loader.get_loader(cfg.target)
+    except ValueError as e:
+        print(f"\n  ✗ {e}")
         return 2
 
-    code_root = ""
-    if cfg.workload and not a.no_sync:
-        r = sync.publish(cfg.workload)
-        code_root = r["root"]
-        print(f"  code: {r['files']} files → {code_root}"
-              + ("   (MUTABLE dev path — commit to pin it)" if r["mutable"] else ""))
+    if a.no_sync:
+        cfg.workload = ""
 
-    job_id = a.job_id or f"job{int(time.time())}"
-    if code_root:
-        spec["code"] = {"root": code_root, "rev": code_root.rsplit("/", 1)[-1]}
-    st = get_storage(cfg.store or None)
-    spec_key = f"runs/{job_id}/spec.json"
-    st.client.put_object(Bucket=st.require().bucket, Key=spec_key,
-                         Body=json.dumps(spec).encode())
-    print(f"  spec: {spec_key}")
-
-    env = launchfile.pod_env(cfg, job_id=job_id, spec_key=spec_key, code_root=code_root)
-    missing = contract.check_env(env)
-    if missing:
-        print("\n  ✗ the harness contract requires variables this launch does not set:")
-        for m in missing:
-            print(f"      {m}")
+    try:
+        run = loader.launch(cfg, spec=spec, job_id=a.job_id or "", dry_run=a.dry_run)
+    except base_loader.LoaderError as e:
+        print(f"\n  ✗ {e}")
         return 2
-
-    create = {"image": cfg.image, "container_disk_gb": cfg.disk_gb,
-              "vcpu_count": cfg.vcpu, "ports": ["8000/http"], "env": env}
-    vol = volume.load(cfg.runpod_volume or None)
-    if vol:
-        vol.require_provider("runpod")
-        create.update(vol.create_kwargs())
-        print(f"  volume: {vol.volume_id} in {vol.datacenter} "
-              f"(pins compute to that datacenter)")
-
-    if a.dry_run:
-        print("\n  --dry-run: everything validated, nothing provisioned")
-        print(f"  would try: {len(list(reaper.placements(**{k: v for k, v in launchfile.capacity_kwargs(cfg).items() if k != 'max_cost_hr'})))} placements")
+    if run is None:
         return 0
 
-    with reaper.pod(create, budget_min=cfg.budget_min, name=f"job-{job_id}",
-                    capacity=launchfile.capacity_kwargs(cfg)) as pod:
-        pod_id = pod["pod_id"] if isinstance(pod, dict) else pod
-        print(f"\n  ✓ pod {pod_id}  job={job_id}")
-        print(f"  watch:  python runctl.py watch --job {job_id}")
-        print(f"  status: python runctl.py poll  --job {job_id}")
+    print(f"\n  ✓ {run.target}: {run.handle}  job={run.job_id}"
+          + (f"  ${run.cost_hr}/hr" if run.cost_hr else "  (free)"))
+    for k, v in run.detail.items():
+        if v:
+            print(f"      {k}: {v}")
+    if run.endpoint:
+        print(f"  watch:  python runctl.py watch --job {run.job_id}")
+        print(f"  api:    {run.endpoint}/v1/jobs/{run.job_id}/summary")
     return 0
 
 

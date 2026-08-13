@@ -145,16 +145,20 @@ python -m pod_loader.launchfile              # show what resolved, and check it
 
 ```bash
 # ---- destination -------------------------------------------------------------
-TARGET            = runpod                 # runpod | docker | local
+TARGET            = runpod                 # runpod | docker | direct
 IMAGE             = ghcr.io/itsnotyoutoday/pod-harness:latest
 
-# ---- capacity, in priority order ---------------------------------------------
-COMPUTE           = CPU
-CPU_FLAVORS       = cpu3c,cpu3g,cpu5c,cpu5g,cpu3m,cpu5m
-GPU_TYPES         = NVIDIA RTX A4000,NVIDIA RTX A4500,NVIDIA RTX A5000
-CLOUD             = SECURE,COMMUNITY
-FALLBACK_TO_GPU   = false
-MAX_COST_HR       = 0.20
+# ---- capacity ----------------------------------------------------------------
+COMPUTE           = CPU                    # generic: every target understands it
+MAX_COST_HR       = 0.20                   # generic
+
+# PODH_RUNPOD_* = "this line stops meaning anything if you change TARGET".
+# Network volumes, CPU flavours and cloud tiers are RunPod's concepts, not the
+# framework's.
+PODH_RUNPOD_CPU_FLAVORS = cpu3c,cpu3g,cpu5c,cpu5g,cpu3m,cpu5m
+PODH_RUNPOD_GPU_TYPES   = NVIDIA RTX A4000,NVIDIA RTX A4500,NVIDIA RTX A5000
+PODH_RUNPOD_CLOUD       = SECURE,COMMUNITY
+PODH_RUNPOD_FALLBACK_TO_GPU = false
 
 # ---- cost --------------------------------------------------------------------
 BUDGET_MIN        = 60                     # hard kill, enforced outside the pod
@@ -162,7 +166,7 @@ QUEUE_DEADLINE_MIN= 240
 
 # ---- storage -----------------------------------------------------------------
 STORE             = runpod                 # a PROFILE, never a credential
-RUNPOD_VOLUME     = ~/runpod-volume.key    # RunPod only; PINS the datacentre
+PODH_RUNPOD_VOLUME = ~/runpod-volume.key   # RunPod only; PINS the datacentre
 CACHE             = persistent             # persistent | ephemeral | off
 
 # ---- the job -----------------------------------------------------------------
@@ -338,10 +342,32 @@ Read the required env set from the contract rather than hardcoding it: when the 
 starts needing a new root, launches fail while composing instead of the pod refusing to
 boot.
 
-### Adding a provider
+### Targets, and adding one
 
-`provider.py` defines the interface; `RunPodProvider` and `LocalProvider` implement it.
-Adding a backend is a class, not a rewrite — everything above it speaks the same `/v1`.
+`TARGET` in the launch file picks a class, not a branch:
+
+| target | what it is | cost |
+|---|---|---|
+| `runpod` | a rented pod, with the capacity walk and cost ceiling | billed |
+| `docker` | a container on this machine, from the same image | free |
+| `direct` | the harness in your interpreter — no container, no `/v1` | free |
+
+```
+src/pod_loader/
+  base_loader.py       the sequence every launch shares
+  runpod/              api, volume, reaper, capacity, RunPodLoader
+  local/               DockerLoader, DirectLoader
+```
+
+`BaseLoader.launch()` publishes the code, stages the spec, composes the environment and
+validates both against the harness contract. A subclass supplies only three things:
+`preflight()`, `start()`, `stop()`. So a new backend cannot accidentally skip contract
+validation — it never writes that part.
+
+RunPod is one vendor among several that rent containers by the hour. Vast.ai, Lambda,
+Paperspace, CoreWeave or a Kubernetes cluster you already own are each a subclass in their
+own package, registered in `base_loader._registry()`. Nothing else in the launch path
+changes, because every destination runs the same image and speaks the same `/v1`.
 
 ### Storage layout
 

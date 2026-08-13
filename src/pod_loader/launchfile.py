@@ -20,13 +20,13 @@ you can run from any subdirectory of it.
     IMAGE              ghcr.io/…/pod-harness:latest
     VCPU  DISK_GB
 
-    # ---- capacity, in priority order -----------------------------------
-    COMPUTE            CPU | GPU
-    CPU_FLAVORS        cpu3c,cpu3g,cpu5c,…      tried in this order
-    GPU_TYPES          NVIDIA RTX A4000,…       cheapest-capable first
-    CLOUD              SECURE,COMMUNITY
-    FALLBACK_TO_GPU    opt-in; roughly 12x the price
-    MAX_COST_HR        refuses a placement above this, rather than warning
+    # ---- capacity ------------------------------------------------------
+    COMPUTE                       CPU | GPU        (generic)
+    MAX_COST_HR                   refuses a placement above this  (generic)
+    PODH_RUNPOD_CPU_FLAVORS       cpu3c,cpu3g,…    tried in this order
+    PODH_RUNPOD_GPU_TYPES         NVIDIA RTX A4000,…
+    PODH_RUNPOD_CLOUD             SECURE,COMMUNITY
+    PODH_RUNPOD_FALLBACK_TO_GPU   opt-in; roughly 12x the price
 
     # ---- cost ----------------------------------------------------------
     BUDGET_MIN         hard kill, enforced from outside the pod
@@ -36,7 +36,7 @@ you can run from any subdirectory of it.
     STORE              runpod | cloudflare | aws | minio      (a profile, not a secret)
     STORE_KEYFILE      durable source of truth
     VOLUME_KEYFILE     provider-local volume gateway
-    RUNPOD_VOLUME      RunPod only; PINS the datacenter
+    PODH_RUNPOD_VOLUME RunPod only; PINS the datacenter
     CACHE              persistent | ephemeral | off
 
     # ---- the job -------------------------------------------------------
@@ -138,6 +138,7 @@ class LaunchConfig:
     volume_keyfile: str = ""            # provider-local volume gateway
     runpod_volume: str = ""             # RunPod only; PINS the datacenter
     cache: str = "persistent"           # persistent | ephemeral | off
+    local_workspace: str = "./work"     # TARGET=docker mounts this as /workspace
 
     job_spec: str = ""
     workload: str = ""
@@ -172,7 +173,19 @@ def load(path: str | Path | None = None) -> LaunchConfig:
             f"  A launch file lives next to the job, which means it gets committed.")
 
     def g(key, default=""):
-        return kv.get(key, default)
+        """Read a key, accepting the unprefixed spelling as an alias.
+
+        Provider-specific settings are PODH_RUNPOD_* so a launch file shows at a glance
+        which lines stop working the moment you change TARGET. Network volumes, CPU
+        flavours and cloud tiers are RunPod's concepts, not the framework's — the
+        unprefixed names implied they were portable.
+        """
+        if key in kv:
+            return kv[key]
+        for pre in ("PODH_RUNPOD_", "PODH_", "RUNPOD_"):
+            if key.startswith(pre) and key[len(pre):] in kv:
+                return kv[key[len(pre):]]
+        return default
 
     def num(key, default):
         try:
@@ -184,11 +197,11 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         target=g("TARGET", "runpod").lower(),
         image=g("IMAGE") or LaunchConfig.image,
         compute=g("COMPUTE", "CPU").upper(),
-        flavors=tuple(x.strip() for x in g("CPU_FLAVORS").split(",") if x.strip()),
-        gpu_types=tuple(x.strip() for x in g("GPU_TYPES").split(",") if x.strip()),
-        clouds=tuple(x.strip().upper() for x in g("CLOUD").split(",") if x.strip())
+        flavors=tuple(x.strip() for x in g("PODH_RUNPOD_CPU_FLAVORS").split(",") if x.strip()),
+        gpu_types=tuple(x.strip() for x in g("PODH_RUNPOD_GPU_TYPES").split(",") if x.strip()),
+        clouds=tuple(x.strip().upper() for x in g("PODH_RUNPOD_CLOUD").split(",") if x.strip())
                 or LaunchConfig.clouds,
-        fallback_to_gpu=g("FALLBACK_TO_GPU", "false").lower() in ("1","true","yes"),
+        fallback_to_gpu=g("PODH_RUNPOD_FALLBACK_TO_GPU", "false").lower() in ("1","true","yes"),
         max_cost_hr=num("MAX_COST_HR", 0.0),
         budget_min=num("BUDGET_MIN", 60.0),
         queue_deadline_min=num("QUEUE_DEADLINE_MIN", 0.0),
@@ -198,7 +211,8 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         store_keyfile=g("STORE_KEYFILE"),
         volume_keyfile=g("VOLUME_KEYFILE"),
         cache=g("CACHE", "persistent").lower(),
-        runpod_volume=g("RUNPOD_VOLUME"),
+        local_workspace=g("LOCAL_WORKSPACE", "./work"),
+        runpod_volume=g("PODH_RUNPOD_VOLUME"),
         job_spec=g("JOB_SPEC"),
         workload=g("WORKLOAD"),
         autorun=g("AUTORUN", "true").lower() in ("1", "true", "yes"),
@@ -267,8 +281,15 @@ def capacity_kwargs(cfg: LaunchConfig) -> dict:
 def check(cfg: LaunchConfig) -> list[str]:
     """Problems that would waste a launch. Cheap, and run before anything is provisioned."""
     problems = []
-    if cfg.target not in ("runpod", "local"):
-        problems.append(f"TARGET={cfg.target!r} is not runpod or local")
+    # Ask the registry rather than carrying a list. A hardcoded pair went stale the moment
+    # "local" became "direct" and "docker" was added, and rejected a target that worked.
+    try:
+        from .base_loader import _registry
+        known = sorted(_registry())
+        if cfg.target not in known:
+            problems.append(f"TARGET={cfg.target!r} is not one of: {', '.join(known)}")
+    except Exception as e:
+        problems.append(f"could not resolve targets: {e}")
     if cfg.job_spec and not Path(cfg.job_spec).expanduser().exists():
         problems.append(f"JOB_SPEC not found: {cfg.job_spec}")
     if cfg.workload and not (Path(cfg.workload).expanduser() / "code").is_dir():
@@ -302,19 +323,23 @@ IMAGE             = ghcr.io/itsnotyoutoday/pod-harness:latest
 VCPU              = 8
 DISK_GB           = 30
 
-# ---- capacity, in priority order ---------------------------------------------
-# RunPod takes the first shape with capacity, so a sold-out model degrades rather
-# than failing. The walk covers three dimensions: flavor, cloud, and compute type.
+# ---- capacity ----------------------------------------------------------------
+# Generic. Every target understands these.
 COMPUTE           = CPU
-CPU_FLAVORS       = cpu3c,cpu3g,cpu5c,cpu5g,cpu3m,cpu5m
-GPU_TYPES         = NVIDIA RTX A4000,NVIDIA RTX A4500,NVIDIA RTX A5000
-CLOUD             = SECURE,COMMUNITY
+MAX_COST_HR       = 0.20
+
+# RunPod-specific. PODH_RUNPOD_* means "this line stops meaning anything the moment
+# you change TARGET" — network volumes, CPU flavours and cloud tiers are RunPod's
+# concepts, not the framework's. RunPod takes the first shape with capacity, so a
+# sold-out model degrades rather than failing.
+PODH_RUNPOD_CPU_FLAVORS = cpu3c,cpu3g,cpu5c,cpu5g,cpu3m,cpu5m
+PODH_RUNPOD_GPU_TYPES   = NVIDIA RTX A4000,NVIDIA RTX A4500,NVIDIA RTX A5000
+PODH_RUNPOD_CLOUD       = SECURE,COMMUNITY
 
 # GPU is roughly 12x the price of CPU ($0.06/hr vs $0.74/hr), so falling back to it
 # is opt-in and requires a ceiling. A 4-minute benchmark does not care; a 6-hour
 # corpus build is $0.36 against $4.44.
-FALLBACK_TO_GPU   = false
-MAX_COST_HR       = 0.20
+PODH_RUNPOD_FALLBACK_TO_GPU = false
 
 # ---- cost --------------------------------------------------------------------
 BUDGET_MIN        = 60                     # hard kill, enforced from outside the pod
@@ -327,7 +352,7 @@ QUEUE_DEADLINE_MIN= 240                    # stop waiting for capacity after thi
 STORE             = runpod
 STORE_KEYFILE     = ~/s3-cloudfare.key     # durable source of truth
 VOLUME_KEYFILE    = ~/runpod-storage.key   # provider-local volume gateway
-RUNPOD_VOLUME     = ~/runpod-volume.key    # RunPod only; PINS the datacenter
+PODH_RUNPOD_VOLUME = ~/runpod-volume.key   # RunPod only; PINS the datacenter
 CACHE             = persistent             # persistent | ephemeral | off
 
 # ---- the job -----------------------------------------------------------------
