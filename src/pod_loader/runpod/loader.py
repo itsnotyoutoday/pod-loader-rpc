@@ -90,7 +90,12 @@ class RunPodLoader(BaseLoader):
     def create_kwargs(self, cfg, *, env: dict) -> dict:
         from . import volume
         auth = self._registry_auth_id(cfg)
-        kw = {"name": "queued-job", "image": cfg.image,
+        # Named here, not by the control plane. This was the literal "queued-job", so
+        # every pod placed through the queue carried the same meaningless label, and
+        # pod-control's setdefault could never improve on it — a default that is always
+        # present is not a default. The job id is in env; the workload is in cfg.
+        kw = {"name": pod_name(env.get("PODH_JOB_ID", ""),
+                               getattr(cfg, "workload", "")), "image": cfg.image,
               **({"registry_auth_id": auth} if auth else {}),
               "container_disk_gb": cfg.disk_gb, "vcpu_count": cfg.vcpu,
               "ports": ["8000/http"], "env": env}
