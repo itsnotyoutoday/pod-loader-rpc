@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 import warnings
 from pathlib import Path
@@ -150,6 +151,74 @@ def _code_store(a):
     cfg = st.require()
     print(f"  store    : {profile or '(default)'} → {cfg.bucket}")
     return st
+
+
+def cmd_promote(a) -> int:
+    """Promote a run's profile to assets/profiles/<region>/<run_id>/, and point `current`.
+
+    Promotion happens automatically when the profile stage succeeds, but it should not ONLY
+    happen there. "The profile we stand behind" is a judgement, not a side effect of the
+    most recent run finishing:
+
+      - a later run can be worse; you may want to keep pointing at an earlier one
+      - automatic promotion is deliberately non-fatal, so it can fail while the run succeeds
+      - a run that completed before promotion existed still has a perfectly good profile
+
+    Copies server-side — the objects never travel to this machine and back.
+
+    `current` is written LAST, so it can never name a directory that is not complete.
+    """
+    st = _code_store(a)
+    cfg = st.require()
+    region = a.region
+    base = f"assets/profiles/{region}"
+
+    if a.show:
+        cur = ""
+        try:
+            cur = st.client.get_object(
+                Bucket=cfg.bucket, Key=f"{base}/current")["Body"].read().decode().strip()
+        except Exception:
+            pass
+        runs = set()
+        for page in st.client.get_paginator("list_objects_v2").paginate(
+                Bucket=cfg.bucket, Prefix=base + "/"):
+            for o in page.get("Contents", []):
+                rest = o["Key"][len(base) + 1:]
+                if "/" in rest:
+                    runs.add(rest.split("/", 1)[0])
+        print(f"\n  region  : {region}")
+        print(f"  current : {cur or '(none)'}")
+        for r in sorted(runs):
+            print(f"    {'→' if r == cur else ' '} {r}")
+        if not runs:
+            print("    (nothing promoted yet)")
+        return 0
+
+    src = f"runs/{a.job}/out/regions/{region}"
+    found = []
+    for page in st.client.get_paginator("list_objects_v2").paginate(
+            Bucket=cfg.bucket, Prefix=src + "/"):
+        for o in page.get("Contents", []):
+            found.append(o["Key"])
+    if not found:
+        print(f"\n  ✗ nothing at {src}/")
+        print(f"    That run produced no region artifacts, or the region name is wrong.")
+        return 1
+
+    keep = [k for k in found
+            if not a.only or pathlib.Path(k).name in set(a.only.split(","))]
+    print(f"\n  promoting {len(keep)} artifact(s) from {src}/")
+    for k in keep:
+        dst = f"{base}/{a.job}/{pathlib.Path(k).name}"
+        st.client.copy_object(Bucket=cfg.bucket, Key=dst,
+                              CopySource={"Bucket": cfg.bucket, "Key": k})
+        print(f"    {pathlib.Path(k).name} → {dst}")
+
+    # Last, and only after every artifact is in place.
+    st.client.put_object(Bucket=cfg.bucket, Key=f"{base}/current", Body=a.job.encode())
+    print(f"  current → {a.job}")
+    return 0
 
 
 def cmd_code_push(a) -> int:
@@ -558,6 +627,15 @@ def main() -> int:
     h.add_argument("--as", dest="as", help="upload under a different source id")
     h.set_defaults(fn=cmd_push)
 
+
+
+    pr = sub.add_parser("promote", help="promote a run's profile and move `current`")
+    pr.add_argument("job", nargs="?", default="", help="job id whose profile to promote")
+    pr.add_argument("--region", default="_neutro_v4")
+    pr.add_argument("--only", help="comma-separated filenames, e.g. profile.json")
+    pr.add_argument("--show", action="store_true", help="list what is promoted")
+    pr.add_argument("--store"), pr.add_argument("--env-file")
+    pr.set_defaults(fn=cmd_promote)
 
     cp = sub.add_parser("code-push", help="publish a workload's code/ tree (no pod)")
     cp.add_argument("repo"), cp.add_argument("--workload")
