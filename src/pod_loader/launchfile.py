@@ -152,7 +152,15 @@ class LaunchConfig:
     store: str = ""                     # profile: runpod | cloudflare | aws | minio
     store_keyfile: str = ""             # durable source of truth
     volume_keyfile: str = ""            # provider-local volume gateway
-    runpod_volume: str = ""             # RunPod only; PINS the datacenter
+    #: RunPod only, and it PINS compute to the volume's datacenter. Empty means NO
+    #: volume when a launch file is present — see `volume_declared`.
+    runpod_volume: str = ""
+    #: Did a launch file actually speak about the volume? Omitting the key used to mean
+    #: "search upward for a key file and attach whatever you find", so a job that wanted
+    #: no volume got one anyway — and with it a datacenter pin that made pods
+    #: unobtainable. A launch file is authoritative: if it does not ask for a volume,
+    #: there is no volume.
+    volume_declared: bool = False
     cache: str = "persistent"           # persistent | ephemeral | off
     #: Store profiles whose credentials this job needs ON THE POD. Empty by default: a pod
     #: reading a mounted volume needs no credentials at all, and the fewer places a key
@@ -256,6 +264,7 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         idempotency_key=g("IDEMPOTENCY_KEY"),
         api_token=g("PODH_API_TOKEN"),
         runpod_volume=g("PODH_RUNPOD_VOLUME"),
+        volume_declared=bool(g("PODH_RUNPOD_VOLUME")),
         job_spec=g("JOB_SPEC"),
         workload=g("WORKLOAD"),
         autorun=g("AUTORUN", "true").lower() in ("1", "true", "yes"),
@@ -409,6 +418,11 @@ def check(cfg: LaunchConfig) -> list[str]:
                         "nothing must not be immortal")
     if cfg.control_url and not cfg.control_url.startswith(("http://", "https://")):
         problems.append(f"PODH_CONTROL_URL={cfg.control_url!r} needs a scheme (https://…)")
+    if cfg.runpod_volume and cfg.runpod_volume.lower() in ("none", "off", "no"):
+        problems.append(
+            "PODH_RUNPOD_VOLUME is set to a word rather than a path or id. To run without "
+            "a volume, omit the line entirely — a launch file that does not ask for one "
+            "does not get one.")
     if cfg.control_url and not cfg.queue_deadline_min:
         problems.append(
             "PODH_CONTROL_URL is set with no QUEUE_DEADLINE_MIN. A job queued at 6pm that "

@@ -40,9 +40,14 @@ class RunPodLoader(BaseLoader):
         kw = {"name": "queued-job", "image": cfg.image,
               "container_disk_gb": cfg.disk_gb, "vcpu_count": cfg.vcpu,
               "ports": ["8000/http"], "env": env}
-        vol = volume.load(cfg.runpod_volume or None)
-        if vol:
-            kw.update(vol.create_kwargs())
+        # Only when the launch file asked for one. `volume.load(None)` searches upward
+        # for a key file, so an unset value used to attach a volume anyway — and with it a
+        # datacenter pin. Measured 2026-08-13: identical shapes place without the volume
+        # and return "no capacity" with it, four rounds running, at the same instant.
+        if cfg.volume_declared:
+            vol = volume.load(cfg.runpod_volume or None)
+            if vol:
+                kw.update(vol.create_kwargs())
         return kw
 
     def start(self, cfg, *, job_id: str, env: dict, spec_key: str) -> Running:
@@ -54,12 +59,14 @@ class RunPodLoader(BaseLoader):
         create = {"name": f"job-{job_id}", "image": cfg.image,
                   "container_disk_gb": cfg.disk_gb, "vcpu_count": cfg.vcpu,
                   "ports": ["8000/http"], "env": env}
-        vol = volume.load(cfg.runpod_volume or None)
+        vol = volume.load(cfg.runpod_volume or None) if cfg.volume_declared else None
         if vol:
             vol.require_provider("runpod")
             create.update(vol.create_kwargs())
             self._say(f"volume: {vol.volume_id} in {vol.datacenter} "
-                      f"(pins compute to that datacenter)")
+                      f"(PINS compute to that datacenter)")
+        else:
+            self._say("volume: none — free to land in any datacenter")
 
         # Not a plain create: walks flavor x cloud x compute type, and refuses a placement
         # above MAX_COST_HR rather than silently taking a 12x pricier slot.
