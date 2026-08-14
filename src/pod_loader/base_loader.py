@@ -209,7 +209,10 @@ class BaseLoader:
                 self._say(f"--dry-run: would submit to {cfg.control_url} "
                           f"(queue deadline {cfg.queue_deadline_min:.0f}min)")
                 return None
-            return self.submit_to_control(cfg, job_id=job_id, env=env, spec_key=spec_key)
+            return self.submit_to_control(
+                cfg, job_id=job_id, env=env, spec_key=spec_key,
+                idempotency_key=work_key(spec, code_rev=published.get("tree", ""),
+                                         image=getattr(cfg, "image", "")))
 
         if dry_run:
             self._say(f"--dry-run: validated for {self.name}; {self.plan(cfg)}")
@@ -217,7 +220,7 @@ class BaseLoader:
         return self.start(cfg, job_id=job_id, env=env, spec_key=spec_key)
 
     def submit_to_control(self, cfg, *, job_id: str, env: dict,
-                          spec_key: str) -> Running:
+                          spec_key: str, idempotency_key: str = "") -> Running:
         """Queue the job with pod-control instead of provisioning it here.
 
         The queue, the placement walk and the deadline all move off this machine, which is
@@ -241,10 +244,10 @@ class BaseLoader:
             "max_cost_hr": cfg.max_cost_hr,
             "budget_min": cfg.max_lifetime_min,
             "queue_deadline_min": cfg.queue_deadline_min,
-            # A content fingerprint, not the job id. Defaulting to job_id made this
-            # unable to match anything, because job_id is minted fresh per launch.
-            "idempotency_key": cfg.idempotency_key or work_key(
-                spec, code_rev=code_root or "", image=getattr(cfg, "image", "")),
+            # A content fingerprint, not the job id — computed by the caller, which is
+            # where the spec and the published tree are actually in scope. Defaulting it to
+            # job_id made it unable to match anything, since job_id is minted per launch.
+            "idempotency_key": cfg.idempotency_key or idempotency_key,
         }
         req = urllib.request.Request(
             cfg.control_url.rstrip("/") + "/v1/jobs",

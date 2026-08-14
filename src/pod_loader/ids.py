@@ -58,18 +58,32 @@ def job_id() -> str:
     return f"job_{ulid()}"
 
 
-def pod_name(job: str) -> str:
-    """What the provider should call the pod.
+def pod_name(job: str, workload: str = "") -> str:
+    """What the provider should call the pod. Short, and for humans.
 
-    Just the job id. It already says what it is, and prefixing it produced
-    `job-job1786673987` — which is the kind of thing that makes a console listing harder
-    to read than no naming convention at all.
+        trainer-D0C8GB
 
-    Providers vary in what they accept, so this stays alphanumeric plus underscore and
-    hyphen, and bounded in length.
+    A pod name is a label in a console listing, not an identifier. Exact identity is
+    PODH_JOB_ID in the pod env and the job_id in the control plane, both of which are
+    already exact — so the name should optimise for being readable in a column, which a
+    26-character ULID is not.
+
+    It has been wrong twice in opposite directions. First `job-{job_id}` over ids already
+    starting with "job", giving job-job1786673987. Then the full ULID, giving
+    job-job_01KZZ5G5MW7YEM60B32TD0C8GB — unambiguous and unreadable.
+
+    Workload first, because the question a console listing answers is "what is this pod
+    doing"; six characters of the job id after, which is enough to correlate a row with a
+    log line and far short of needing to be unique on its own.
     """
-    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in job)
-    return safe[:60]
+    tag = (workload or "pod").rstrip("/").rsplit("/", 1)[-1]
+    for prefix in ("lingua-", "pod-"):
+        if tag.startswith(prefix):
+            tag = tag[len(prefix):]
+    short = "".join(c for c in job if c.isalnum())[-6:].upper()
+    name = f"{tag}-{short}" if short else tag
+    # Providers vary in what they accept, so stay alphanumeric plus hyphen and underscore.
+    return "".join(c if (c.isalnum() or c in "-_") else "-" for c in name)[:60]
 
 
 def work_key(spec: dict, code_rev: str = "", image: str = "") -> str:
