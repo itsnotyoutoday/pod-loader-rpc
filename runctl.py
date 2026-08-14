@@ -126,6 +126,97 @@ def cmd_mount(a) -> int:
     return 0 if r.get("ok") else 1
 
 
+def _code_store(a):
+    """The store a launch would actually use — not get_storage()'s default.
+
+    get_storage() with no profile resolves to whatever key file is found first, which here
+    is RunPod S3, while launches pass PODH_S3_PROFILE=cloudflare. Publishing code with the
+    default put it in a bucket no pod would ever read, and push+pull both defaulted the
+    same way so the round trip passed while proving nothing.
+
+    So the profile comes from the launch file — one definition of "which store", shared by
+    the thing that publishes and the thing that runs.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+    from pod_loader.objectstore import get_storage
+    profile = getattr(a, "store", None)
+    if not profile:
+        try:
+            from pod_loader import launchfile
+            profile = launchfile.load(getattr(a, "env_file", None)).store or None
+        except Exception:
+            profile = None
+    st = get_storage(profile)
+    cfg = st.require()
+    print(f"  store    : {profile or '(default)'} → {cfg.bucket}")
+    return st
+
+
+def cmd_code_push(a) -> int:
+    """Publish a workload's code/ tree without launching anything.
+
+    Exists so the round trip can be exercised on its own. Testing publish only through a
+    real launch means every test costs a pod and a wait, which in practice means it is not
+    tested — and this is the machinery every job's code arrives through.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+    from pod_loader import sync
+    from pod_loader.ids import job_id as mint
+
+    job = a.job_id or mint()
+    r = sync.publish(a.repo, workload=a.workload, job_id=job,
+                     store=None if a.dry_run else _code_store(a),
+                     dry_run=a.dry_run)
+    print(f"\n  workload : {r['workload']}")
+    print(f"  job      : {r['job_id']}")
+    print(f"  tree     : {r['tree'][:16]}…")
+    print(f"  files    : {r['files']}  ({r['bytes']/1e3:.1f} KB)")
+    if not a.dry_run:
+        print("  pack     : " + ("reused — this exact tree was already published"
+                                  if r["tree_reused"] else "uploaded (new tree)"))
+        print(f"  pointer  : {r['job_key']}")
+    else:
+        print("  (dry run — nothing written)")
+    return 0
+
+
+def cmd_code_pull(a) -> int:
+    """Rebuild a job's exact code tree locally. The other half of the round trip.
+
+    Uses the same pod_harness.codestore the POD uses, so a green run here means the pod
+    path works — rather than testing a laptop reimplementation of it.
+    """
+    here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(here / "src"))
+    sys.path.insert(0, str(here.parent / "pod-harness" / "src"))
+    from pod_harness import codestore
+
+    key = a.job if "/" in a.job else f"code/{a.workload}/jobs/{a.job}"
+    dest = Path(a.dest or f"./_code/{a.job.rsplit('/', 1)[-1]}")
+    r = codestore.fetch(key, dest, store=_code_store(a))
+    print(f"\n  tree     : {r['tree'][:16]}…")
+    print(f"  git      : {r['git_rev']}" + (" (dirty)" if r["git_dirty"] else ""))
+    print(f"  files    : {r['files']}  ({r['bytes']/1e3:.1f} KB), {r['verified']} verified")
+    print(f"  dest     : {r['dest']}")
+    return 0
+
+
+def cmd_code_gc(a) -> int:
+    """Report content no job points at. Deletes only with --delete, never by age."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+    from pod_loader import sync
+    r = sync.gc(a.workload, store=_code_store(a), dry_run=not a.delete)
+    print(f"\n  workload      : {r['workload']}")
+    print(f"  live          : {r['live_jobs']} job(s) → {r['live_trees']} tree(s)")
+    print(f"  orphaned      : {r['orphans']} object(s) no job references")
+    print(f"  reclaimable   : {r['reclaimable_bytes']/1e3:.1f} KB")
+    if r["dry_run"]:
+        print("  (dry run — pass --delete to remove them)")
+    else:
+        print(f"  deleted       : {r['deleted']} object(s)")
+    return 0
+
+
 def cmd_push(a) -> int:
     """Get the corpus where the runner can see it.
 
@@ -466,6 +557,28 @@ def main() -> int:
     h.add_argument("--limit", type=int, help="upload only the first N files")
     h.add_argument("--as", dest="as", help="upload under a different source id")
     h.set_defaults(fn=cmd_push)
+
+
+    cp = sub.add_parser("code-push", help="publish a workload's code/ tree (no pod)")
+    cp.add_argument("repo"), cp.add_argument("--workload")
+    cp.add_argument("--job-id"), cp.add_argument("--dry-run", action="store_true")
+    cp.add_argument("--store", help="store profile; defaults to the launch file's")
+    cp.add_argument("--env-file", help="launch file to read the store from")
+    cp.set_defaults(fn=cmd_code_push)
+
+    cl = sub.add_parser("code-pull", help="rebuild a job's exact code tree (no pod)")
+    cl.add_argument("job", help="job id, or a full code/<workload>/jobs/<id> key")
+    cl.add_argument("--workload", default="lingua-trainer"), cl.add_argument("--dest")
+    cl.add_argument("--store", help="store profile; defaults to the launch file's")
+    cl.add_argument("--env-file", help="launch file to read the store from")
+    cl.set_defaults(fn=cmd_code_pull)
+
+    cg = sub.add_parser("code-gc", help="report code no job references")
+    cg.add_argument("--workload", default="lingua-trainer")
+    cg.add_argument("--delete", action="store_true", help="actually remove them")
+    cg.add_argument("--store", help="store profile; defaults to the launch file's")
+    cg.add_argument("--env-file", help="launch file to read the store from")
+    cg.set_defaults(fn=cmd_code_gc)
 
     l = sub.add_parser("ls", help="list what is actually in the object store")
     l.add_argument("--prefix", default=""), l.add_argument("--limit", type=int, default=40)

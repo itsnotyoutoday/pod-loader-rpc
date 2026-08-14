@@ -389,9 +389,14 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
     elif cfg.cache == "persistent":
         env["PODH_CACHE_PERSISTENT"] = "1"
     if code_root:
-        env["PODH_CODE_ROOT"] = f"{workspace}/{code_root}"
-        # The object prefix as well as the path, for the same reason as the spec: with no
-        # volume there is no /workspace, and the code has to be fetched rather than found.
+        # code_root is now the JOB POINTER key — code/<workload>/jobs/<job_id> — not a
+        # directory prefix. The pod reads it, learns which tree to rebuild, and fetches one
+        # packed object. PODH_CODE_ROOT stays a plain local path, named by job rather than
+        # by revision, because two jobs sharing a tree still want separate directories.
+        env["PODH_CODE_JOB"] = code_root
+        env["PODH_CODE_ROOT"] = f"{workspace}/code/{job_id}"
+        # Kept so a pod running an OLDER image, which knows only the directory layout,
+        # still finds something rather than failing obscurely. Harmless to the new path.
         env["PODH_CODE_ROOT_KEY"] = code_root
     env.update(cfg.extra_env)          # workload settings, forwarded verbatim
     return env

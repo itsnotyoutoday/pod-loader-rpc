@@ -122,19 +122,20 @@ class BaseLoader:
 
     # -- the generic sequence, shared by every destination -------------------------------
 
-    def publish_code(self, cfg) -> str:
-        """Push the workload's code/ and return the root the pod should import from."""
+    def publish_code(self, cfg, *, job_id: str) -> dict:
+        """Publish the workload's code/ for this job. Returns what the job pins."""
         if not cfg.workload:
-            return ""
+            return {}
         from . import sync
-        r = sync.publish(cfg.workload)
-        note = "   (MUTABLE dev path — commit to pin it)" if r["mutable"] else ""
-        if r.get("skipped"):
-            note = "   (already published, unchanged)"
-        if r.get("pruned"):
-            note += f"   pruned {len(r['pruned'])} old revision(s)"
-        self._say(f"code: {r['files']} files → {r['root']}{note}")
-        return r["root"]
+        from .objectstore import get_storage
+        # The store the POD will read, not get_storage()'s default — those differ, and
+        # publishing to the default put code in a bucket no pod would ever look in.
+        r = sync.publish(cfg.workload, job_id=job_id, store=get_storage(cfg.store or None))
+        note = "" if r.get("tree_reused") else "  (new tree)"
+        if r.get("tree_reused"):
+            note = "  (unchanged — pack already published)"
+        self._say(f"code: {r['files']} files, tree {r['tree'][:12]}{note}")
+        return r
 
     def stage_spec(self, cfg, spec: dict, job_id: str) -> str:
         """Write the spec where the harness will read it, BEFORE anything is created.
@@ -177,10 +178,17 @@ class BaseLoader:
             raise LoaderError(f"target {self.name!r} is not usable:\n" +
                               "\n".join(f"    {b}" for b in blocked))
 
-        code_root = self.publish_code(cfg)
-        if code_root:
-            spec = {**spec, "code": {"root": code_root,
-                                     "rev": code_root.rsplit("/", 1)[-1]}}
+        published = self.publish_code(cfg, job_id=job_id)
+        code_root = published.get("job_key", "") if published else ""
+        if published:
+            # The spec records the TREE, which is what actually determines the bytes that
+            # run. The git rev is a breadcrumb: it can be dirty, and two people can hold
+            # the same sha with different working trees. Recording both means provenance
+            # is exact and still human-readable.
+            spec = {**spec, "code": {"job_key": published["job_key"],
+                                     "tree": published["tree"],
+                                     "git_rev": published.get("git_rev", ""),
+                                     "files": published.get("files", 0)}}
 
         spec_key = self.stage_spec(cfg, spec, job_id) if not dry_run else \
             f"runs/{job_id}/spec.json"
