@@ -128,8 +128,12 @@ class BaseLoader:
             return ""
         from . import sync
         r = sync.publish(cfg.workload)
-        self._say(f"code: {r['files']} files → {r['root']}"
-                  + ("   (MUTABLE dev path — commit to pin it)" if r["mutable"] else ""))
+        note = "   (MUTABLE dev path — commit to pin it)" if r["mutable"] else ""
+        if r.get("skipped"):
+            note = "   (already published, unchanged)"
+        if r.get("pruned"):
+            note += f"   pruned {len(r['pruned'])} old revision(s)"
+        self._say(f"code: {r['files']} files → {r['root']}{note}")
         return r["root"]
 
     def stage_spec(self, cfg, spec: dict, job_id: str) -> str:
@@ -162,7 +166,12 @@ class BaseLoader:
         """The whole sequence. Subclasses do not override this."""
         from . import launchfile
 
-        job_id = job_id or f"job{int(time.time())}"
+        # Sortable and collision-free. The old f"job{int(time.time())}" collided outright
+        # for two launches in the same second, and that id doubles as the idempotency key —
+        # so the second launch was treated as a retry of the first and never ran.
+        from .ids import job_id as _mint
+        from .ids import work_key
+        job_id = job_id or _mint()
         blocked = self.preflight(cfg)
         if blocked:
             raise LoaderError(f"target {self.name!r} is not usable:\n" +
@@ -224,7 +233,10 @@ class BaseLoader:
             "max_cost_hr": cfg.max_cost_hr,
             "budget_min": cfg.max_lifetime_min,
             "queue_deadline_min": cfg.queue_deadline_min,
-            "idempotency_key": cfg.idempotency_key or job_id,
+            # A content fingerprint, not the job id. Defaulting to job_id made this
+            # unable to match anything, because job_id is minted fresh per launch.
+            "idempotency_key": cfg.idempotency_key or work_key(
+                spec, code_rev=code_root or "", image=getattr(cfg, "image", "")),
         }
         req = urllib.request.Request(
             cfg.control_url.rstrip("/") + "/v1/jobs",

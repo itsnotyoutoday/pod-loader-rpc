@@ -1,6 +1,8 @@
 """Launch onto a rented RunPod pod. The expensive destination, so it carries the guards."""
 from __future__ import annotations
 
+from ..ids import pod_name
+
 import time
 
 from ..base_loader import BaseLoader, PodInfo, Running
@@ -112,7 +114,7 @@ class RunPodLoader(BaseLoader):
         if auth:
             self._say("pulling authenticated — Docker Hub allows only 10 anonymous "
                       "pulls/hour per IP, and RunPod addresses are shared")
-        create = {"name": f"job-{job_id}", "image": cfg.image,
+        create = {"name": pod_name(job_id), "image": cfg.image,
                   **({"registry_auth_id": auth} if auth else {}),
                   "container_disk_gb": cfg.disk_gb, "vcpu_count": cfg.vcpu,
                   "ports": ["8000/http"], "env": env}
@@ -136,7 +138,7 @@ class RunPodLoader(BaseLoader):
         # Journalled BEFORE anything else can fail, so a pod whose launcher dies is still
         # discoverable. A pod nobody journaled is a pod nobody can find.
         deadline = time.time() + cfg.max_lifetime_min * 60
-        reaper.journal(pod_id, f"job-{job_id}", cost, deadline)
+        reaper.journal(pod_id, pod_name(job_id), cost, deadline)
         _arm_deadline(pod_id, deadline, cost)
         _register_with_control(cfg, pod_id, deadline, cost, job_id)
         shape = (used.get("cpu_flavor_ids") or used.get("gpu_type_ids") or ["?"])[0]
@@ -240,7 +242,7 @@ def _register_with_control(cfg, pod_id: str, deadline_ts: float, cost_hr: float,
             # pod exists to be registered — the sweep's grace period covers that window.
             data=json.dumps({"pod_id": pod_id, "provider": "runpod",
                              "deadline_ts": deadline_ts, "cost_hr": cost_hr,
-                             "job_id": job_id, "name": f"job-{job_id}",
+                             "job_id": job_id, "name": pod_name(job_id),
                              "pod_token": control_pod_token(cfg, job_id)}).encode(),
             headers={"Content-Type": "application/json",
                      "X-Podh-Token": _control_token(cfg)}, method="POST")

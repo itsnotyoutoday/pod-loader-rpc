@@ -1,6 +1,8 @@
 """Run the job here — in a container, or directly in this interpreter."""
 from __future__ import annotations
 
+from ..ids import pod_name
+
 import os
 import signal
 import subprocess
@@ -32,7 +34,7 @@ class DockerLoader(BaseLoader):
     def start(self, cfg, *, job_id: str, env: dict, spec_key: str) -> Running:
         ws = os.path.abspath(os.path.expanduser(cfg.local_workspace))
         os.makedirs(ws, exist_ok=True)
-        args = ["docker", "run", "-d", "--name", f"podjob-{job_id}", "-p", "8000:8000"]
+        args = ["docker", "run", "-d", "--name", f"podjob-{pod_name(job_id)}", "-p", "8000:8000"]
         for k, v in env.items():
             args += ["-e", f"{k}={v}"]
         args += ["-v", f"{ws}:/workspace", cfg.image]

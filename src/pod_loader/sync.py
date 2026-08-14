@@ -89,7 +89,7 @@ def _files(code_dir: Path) -> list[Path]:
 
 
 def publish(repo: str | Path, *, workload: str | None = None, rev: str | None = None,
-            store=None, dry_run: bool = False) -> dict:
+            store=None, dry_run: bool = False, keep: int = 5) -> dict:
     """Push `<repo>/code/**` to `code/<workload>/<rev>/`. Returns the root a job should use.
 
     The returned `root` is what goes into the spec's `code.root` and reaches the pod as
@@ -143,6 +143,26 @@ def publish(repo: str | Path, *, workload: str | None = None, rev: str | None = 
         store = get_storage()
     cfg = store.require()
 
+    # Skip the upload entirely when this revision is already published intact.
+    #
+    # An immutable sha directory cannot legitimately differ from itself, so re-uploading it
+    # on every launch was pure repetition — 55 objects each time, and the launch waiting on
+    # them. The stored manifest is the check: same rev AND same per-file hashes means the
+    # bytes on the far end are the bytes here.
+    #
+    # `dev` is exempt because it is mutable by design; that is the entire point of it.
+    if rev != "dev":
+        try:
+            prior = json.loads(store.client.get_object(
+                Bucket=cfg.bucket, Key=f"{root}/.manifest.json")["Body"].read())
+            if prior.get("files") == manifest["files"]:
+                result["skipped"] = True
+                store.client.put_object(Bucket=cfg.bucket,
+                                        Key=f"code/{workload}/latest", Body=rev.encode())
+                return result
+        except Exception:
+            pass                    # not published, or unreadable — publish it properly
+
     for p in files:
         rel = p.relative_to(code_dir).as_posix()
         store.client.put_object(Bucket=cfg.bucket, Key=f"{root}/{rel}",
@@ -153,7 +173,66 @@ def publish(repo: str | Path, *, workload: str | None = None, rev: str | None = 
     # pointer and not a copy: one small object to update, and nothing can be half-updated.
     store.client.put_object(Bucket=cfg.bucket, Key=f"code/{workload}/latest",
                             Body=rev.encode())
+    result["pruned"] = prune(workload, keep=keep, store=store)
     return result
+
+
+def prune(workload: str, *, keep: int = 5, store=None) -> list:
+    """Delete all but the newest `keep` published revisions.
+
+    Revisions accumulated forever: one directory per code change, none ever removed. They
+    are small, which is exactly why nobody notices — the cost is a listing that becomes
+    unreadable and no way to tell which of nine shas anything actually ran.
+
+    Ordered by the manifest's published_at rather than by name, because a git sha carries
+    no order. `dev` and `latest` are never touched: one is the mutable working path and the
+    other is the pointer that makes the newest revision findable.
+
+    A revision that is currently referenced by `latest` is never pruned regardless of age.
+    """
+    if store is None:
+        from .objectstore import get_storage
+        store = get_storage()
+    cfg = store.require()
+    base = f"code/{workload}/"
+
+    current = ""
+    try:
+        current = store.client.get_object(
+            Bucket=cfg.bucket, Key=f"{base}latest")["Body"].read().decode().strip()
+    except Exception:
+        pass
+
+    revs = {}
+    for page in store.client.get_paginator("list_objects_v2").paginate(
+            Bucket=cfg.bucket, Prefix=base):
+        for o in page.get("Contents", []):
+            rest = o["Key"][len(base):]
+            if "/" not in rest:
+                continue                       # the `latest` pointer itself
+            r = rest.split("/", 1)[0]
+            revs.setdefault(r, []).append(o["Key"])
+
+    ordered = []
+    for r in revs:
+        if r in ("dev", current):
+            continue
+        when = ""
+        try:
+            when = json.loads(store.client.get_object(
+                Bucket=cfg.bucket, Key=f"{base}{r}/.manifest.json"
+            )["Body"].read()).get("published_at", "")
+        except Exception:
+            pass
+        ordered.append((when, r))
+    ordered.sort(reverse=True)
+
+    removed = []
+    for _, r in ordered[max(keep - 1, 0):]:
+        for k in revs[r]:
+            store.client.delete_object(Bucket=cfg.bucket, Key=k)
+        removed.append(r)
+    return removed
 
 
 def resolve(workload: str, rev: str = "latest", store=None) -> str:
