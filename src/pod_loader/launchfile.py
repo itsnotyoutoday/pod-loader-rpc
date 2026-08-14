@@ -335,6 +335,9 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
         "PODH_WORKSPACE": workspace,
         "PODH_JOB_ID": job_id,
         "PODH_JOB_SPEC": f"{workspace}/{spec_key}",
+        # The object key as well as the path. With a volume the path resolves directly;
+        # without one there is no /workspace, and the harness fetches this key instead.
+        "PODH_JOB_SPEC_KEY": spec_key,
         "PODH_LOG_ROOT": f"{workspace}/runs",
         "PODH_RUN_PREFIX": f"runs/{job_id}",
         "PODH_WRITE_PREFIXES": f"runs/{job_id},_tmp/",
