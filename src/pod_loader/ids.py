@@ -76,10 +76,22 @@ def pod_name(job: str, workload: str = "") -> str:
     doing"; six characters of the job id after, which is enough to correlate a row with a
     log line and far short of needing to be unique on its own.
     """
-    tag = (workload or "pod").rstrip("/").rsplit("/", 1)[-1]
+    # The workload is a repo PATH, and it is routinely "." — the launch file names the
+    # directory it sits in. Resolving it is what turns "." into "lingua-trainer"; without
+    # that the tag came out empty and produced the name "--P5JZ0V", which is worse than the
+    # long id it replaced.
+    from pathlib import Path as _P
+    tag = ""
+    if workload:
+        try:
+            tag = _P(workload).resolve().name
+        except Exception:
+            tag = str(workload).rstrip("/").rsplit("/", 1)[-1]
     for prefix in ("lingua-", "pod-"):
         if tag.startswith(prefix):
             tag = tag[len(prefix):]
+    # Anything that did not survive that is not worth guessing at.
+    tag = "".join(c for c in tag if c.isalnum() or c in "-_").strip("-_") or "pod"
     short = "".join(c for c in job if c.isalnum())[-6:].upper()
     name = f"{tag}-{short}" if short else tag
     # Providers vary in what they accept, so stay alphanumeric plus hyphen and underscore.
