@@ -179,6 +179,10 @@ class LaunchConfig:
     #: so pods verify it by PIN rather than by CA — one exact certificate instead
     #: of any certificate any CA was willing to sign.
     control_fingerprint: str = ""
+    #: Path to registry credentials. Not for privacy — our images are public —
+    #: but for rate limits: anonymous Docker Hub pulls are capped per IP, and
+    #: RunPod addresses are shared with every other tenant.
+    registry_keyfile: str = ""
     idempotency_key: str = ""
     #: Usually left empty and minted per job. Set it only when something outside
     #: this launch needs to poll the pod and cannot be told the minted value.
@@ -261,6 +265,7 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         control_url=g("PODH_CONTROL_URL").rstrip("/"),
         control_token_file=g("PODH_CONTROL_TOKEN_FILE"),
         control_fingerprint=g("PODH_CONTROL_FINGERPRINT"),
+        registry_keyfile=g("REGISTRY_KEYFILE"),
         idempotency_key=g("IDEMPOTENCY_KEY"),
         api_token=g("PODH_API_TOKEN"),
         runpod_volume=g("PODH_RUNPOD_VOLUME"),
@@ -385,6 +390,9 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
         env["PODH_CACHE_PERSISTENT"] = "1"
     if code_root:
         env["PODH_CODE_ROOT"] = f"{workspace}/{code_root}"
+        # The object prefix as well as the path, for the same reason as the spec: with no
+        # volume there is no /workspace, and the code has to be fetched rather than found.
+        env["PODH_CODE_ROOT_KEY"] = code_root
     env.update(cfg.extra_env)          # workload settings, forwarded verbatim
     return env
 

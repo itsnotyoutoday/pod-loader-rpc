@@ -35,9 +35,61 @@ class RunPodLoader(BaseLoader):
         ceiling = f", refusing anything above ${cfg.max_cost_hr}/hr" if cfg.max_cost_hr else ""
         return f"would try {n} placements{ceiling}"
 
+    def _registry_auth_id(self, cfg) -> str:
+        """Credentials for pulling our image, registered with RunPod once and reused.
+
+        Not about privacy — our images are public. It is about RATE LIMITS: Docker Hub
+        allows 10 anonymous pulls per hour PER IP, and RunPod datacenter addresses are
+        shared with every other tenant on that machine. Anonymous pulls there fail with
+        429 at random, which is a worse problem than the slow GHCR pulls this is meant to
+        replace: a slow pull eventually succeeds. An authenticated free account gets 100
+        pulls/hour counted against the ACCOUNT rather than the shared address.
+
+        Registered lazily and matched by name, so this costs one API call the first time
+        and none afterwards.
+        """
+        import pathlib as _pl
+
+        keyfile = getattr(cfg, "registry_keyfile", "") or ""
+        if not keyfile:
+            for c in ("dockerhub.key", "../dockerhub.key", "~/dockerhub.key"):
+                p = _pl.Path(c).expanduser()
+                if p.is_file():
+                    keyfile = str(p)
+                    break
+            else:
+                from .volume import _search_up
+                found = _search_up(("dockerhub.key",))
+                keyfile = str(found) if found else ""
+        if not keyfile:
+            return ""
+
+        kv = {}
+        for line in _pl.Path(keyfile).expanduser().read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k.strip().lower()] = v.strip()
+        user = kv.get("username") or kv.get("user")
+        token = kv.get("token") or kv.get("password") or kv.get("pat")
+        if not user or not token:
+            return ""
+
+        from .api import RunPodAPI
+        api = RunPodAPI()
+        label = f"dockerhub-{user}"
+        for a in api.registry_auths():
+            if a.get("name") == label:
+                return a.get("id", "")
+        rec = api.add_registry_auth(label, user, token)
+        print(f"  registered Docker Hub credentials with RunPod as {label}", flush=True)
+        return rec.get("id", "")
+
     def create_kwargs(self, cfg, *, env: dict) -> dict:
         from . import volume
+        auth = self._registry_auth_id(cfg)
         kw = {"name": "queued-job", "image": cfg.image,
+              **({"registry_auth_id": auth} if auth else {}),
               "container_disk_gb": cfg.disk_gb, "vcpu_count": cfg.vcpu,
               "ports": ["8000/http"], "env": env}
         # Only when the launch file asked for one. `volume.load(None)` searches upward
@@ -56,7 +108,12 @@ class RunPodLoader(BaseLoader):
 
         # The name is required by the API and is also how the reaper's sweep recognises
         # its own work, so it is set here rather than left to the caller.
+        auth = self._registry_auth_id(cfg)
+        if auth:
+            self._say("pulling authenticated — Docker Hub allows only 10 anonymous "
+                      "pulls/hour per IP, and RunPod addresses are shared")
         create = {"name": f"job-{job_id}", "image": cfg.image,
+                  **({"registry_auth_id": auth} if auth else {}),
                   "container_disk_gb": cfg.disk_gb, "vcpu_count": cfg.vcpu,
                   "ports": ["8000/http"], "env": env}
         vol = volume.load(cfg.runpod_volume or None) if cfg.volume_declared else None
