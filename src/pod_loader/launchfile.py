@@ -183,6 +183,12 @@ class LaunchConfig:
     #: but for rate limits: anonymous Docker Hub pulls are capped per IP, and
     #: RunPod addresses are shared with every other tenant.
     registry_keyfile: str = ""
+    #: Key for the LLM that mines the academic corpus. The ruleset stage needs it; without
+    #: one the stage no-ops and the pipeline silently falls back to whatever prescriptions
+    #: are hardcoded downstream — which is exactly what happened for every run before this
+    #: field existed. Read on the LAUNCHER and passed as an env var, like every other
+    #: credential a pod is given.
+    llm_keyfile: str = ""
     idempotency_key: str = ""
     #: Usually left empty and minted per job. Set it only when something outside
     #: this launch needs to poll the pod and cannot be told the minted value.
@@ -266,6 +272,7 @@ def load(path: str | Path | None = None) -> LaunchConfig:
         control_token_file=g("PODH_CONTROL_TOKEN_FILE"),
         control_fingerprint=g("PODH_CONTROL_FINGERPRINT"),
         registry_keyfile=g("REGISTRY_KEYFILE"),
+        llm_keyfile=g("LLM_KEYFILE"),
         idempotency_key=g("IDEMPOTENCY_KEY"),
         api_token=g("PODH_API_TOKEN"),
         runpod_volume=g("PODH_RUNPOD_VOLUME"),
@@ -292,6 +299,16 @@ def apply_to_environ(cfg: LaunchConfig) -> None:
         os.environ["RUNPOD_VOLUME"] = str(Path(cfg.runpod_volume).expanduser())
     if cfg.store_keyfile:
         os.environ["PODH_S3_KEY_FILE"] = str(Path(cfg.store_keyfile).expanduser())
+    if cfg.llm_keyfile:
+        # The VALUE, not the path: the file lives on the launcher and the pod has no way to
+        # read it. Everything else here forwards a path because the harness resolves those
+        # against the mount; an LLM key has no mount to come from.
+        f = Path(cfg.llm_keyfile).expanduser()
+        if f.exists():
+            os.environ["PODH_LLM_KEY"] = f.read_text().strip()
+        else:
+            print(f"  ⚠ LLM_KEYFILE {f} does not exist — the ruleset stage will find no "
+                  f"model and mine nothing")
 
 
 def _minted_token(job_id: str) -> str:
@@ -350,6 +367,13 @@ def pod_env(cfg: LaunchConfig, *, job_id: str, spec_key: str, code_root: str = "
         "PODH_MAX_LIFE_SEC": str(int(cfg.max_lifetime_min * 60)),
         "PODH_MAX_IDLE_SEC": "0",
     }
+    # The LLM key, if one was supplied. Sent as a value because the pod has no way to read
+    # a file on the launcher — and required by the ruleset stage, which mines the academic
+    # corpus. Absent, that stage finds no model and silently mines nothing.
+    if cfg.llm_keyfile:
+        f = Path(cfg.llm_keyfile).expanduser()
+        if f.exists():
+            env["PODH_LLM_KEY"] = f.read_text().strip()
     # The pod reports to pod-control only if it was told where, with what token, and
     # which certificate to expect. All three or none: a heartbeat that cannot verify the
     # endpoint must not send the token at all.
