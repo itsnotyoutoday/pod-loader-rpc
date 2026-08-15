@@ -201,7 +201,8 @@ def placements(*, compute: str = "CPU", flavors=FLAVORS, gpu_types=GPU_TYPES,
 def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
                          flavors=FLAVORS, gpu_types=GPU_TYPES,
                          clouds=("SECURE", "COMMUNITY"), fallback_to_gpu: bool = False,
-                         max_cost_hr: float = 0.0, verbose: bool = True):
+                         max_cost_hr: float = 0.0, verbose: bool = True,
+                         on_attempt=None):
     """Create a pod, walking placements until one is available AND affordable.
 
     There is no way to ASK RunPod whether a shape is free — no dry run, no availability
@@ -211,7 +212,30 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
     Cost and capacity resolve together into one decision. If the only free slot costs more
     than the job allows, that is not a placement — it is a reason to keep waiting. Checking
     them separately is how you end up paying 12x for a job that was happy to wait.
+
+    ## on_attempt
+
+    Called as `on_attempt(label, outcome, cost_hr, detail)` once per placement tried, where
+    outcome is `full`, `too_dear` or `placed`. Optional, and failures in it are swallowed:
+    a caller that wants to RECORD the walk must not be able to break the walk.
+
+    This exists because the walk is the most informative thing that happens here and it was
+    being destroyed. Up to twelve combinations get probed, and the only trace was a rendered
+    exception message — so "which shapes have had capacity this week" was unanswerable by
+    the one component that had asked, several hundred times. The callback keeps that
+    knowledge where it can be kept: the caller's own store. This module still writes
+    nothing down, which is what keeps it usable from a laptop.
     """
+    def _note(label, outcome, cost_hr=0.0, detail=""):
+        if on_attempt is None:
+            return
+        try:
+            on_attempt(label, outcome, cost_hr, detail)
+        except Exception as exc:                            # pragma: no cover - defensive
+            if verbose:
+                print(f"  [capacity] on_attempt raised, ignored: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+
     tried, too_dear = [], []
     for place in placements(compute=compute, flavors=flavors, gpu_types=gpu_types,
                             clouds=clouds, fallback_to_gpu=fallback_to_gpu):
@@ -223,6 +247,7 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
             if not _is_capacity_error(exc):
                 raise
             tried.append(label)
+            _note(label, "full", 0.0, str(exc)[:200])
             if verbose:
                 print(f"  [capacity] {label} full", flush=True)
             continue
@@ -235,11 +260,13 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
             except Exception:
                 pass
             too_dear.append(f"{label} @ ${cost}/hr")
+            _note(label, "too_dear", cost, f"ceiling ${max_cost_hr}/hr")
             if verbose:
                 print(f"  [capacity] {label} available but ${cost}/hr exceeds "
                       f"${max_cost_hr}/hr — released", flush=True)
             continue
 
+        _note(label, "placed", cost, "")
         if verbose and tried:
             print(f"  [capacity] got {label} @ ${cost}/hr after {len(tried)} full",
                   flush=True)
