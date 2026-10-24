@@ -182,7 +182,11 @@ class RunPodAPI:
                compute_type: str = "GPU",
                vcpu_count: int = 16,
                cpu_flavor_ids: list[str] | None = None,
-               start_ssh: bool = False) -> dict:
+               start_ssh: bool = False,
+               allowed_cuda_versions: list[str] | None = None,
+               min_ram_per_gpu: int | None = None,
+               min_vcpu_per_gpu: int | None = None,
+               data_center_ids: list[str] | None = None) -> dict:
         """Provision a pod. THIS STARTS BILLING.
 
         `gpu_type_ids` is a preference list — RunPod picks the first with capacity, which
@@ -221,6 +225,21 @@ class RunPodAPI:
         else:
             body["gpuTypeIds"] = gpu_type_ids or []
             body["gpuCount"] = gpu_count
+            # Host filters. An image built for CUDA 12.8 boots on an older driver and then
+            # dies, billing the whole time, so the CUDA floor belongs at placement.
+            if allowed_cuda_versions:
+                body["allowedCudaVersions"] = list(allowed_cuda_versions)
+            if min_ram_per_gpu:
+                body["minRAMPerGPU"] = int(min_ram_per_gpu)
+            if min_vcpu_per_gpu:
+                body["minVCPUPerGPU"] = int(min_vcpu_per_gpu)
+        if data_center_ids:
+            # A network volume already pins the datacentre; naming others as well can only
+            # produce a pod that cannot mount its volume, so that is refused, not merged.
+            if network_volume_id:
+                raise ValueError("data_center_ids and network_volume_id are exclusive: "
+                                 "the volume pins the datacentre")
+            body["dataCenterIds"] = list(data_center_ids)
         if ports:
             body["ports"] = ports
         if network_volume_id:
