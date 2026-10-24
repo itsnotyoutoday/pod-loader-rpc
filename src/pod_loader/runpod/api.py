@@ -32,6 +32,10 @@ import urllib.error
 import urllib.request
 
 API = "https://rest.runpod.io/v1"
+
+#: The REST API is behind Cloudflare too, which now rejects urllib's default agent
+#: with `error code: 1010` (a 403 that looks like a bad key). Any named agent passes.
+USER_AGENT = "pod-loader-rpc/0.1"
 KEY_FILES = ("runpod.key", "../runpod.key", "/run/secrets/runpod.key")
 
 def _search_up(name: str, start: pathlib.Path | None = None,
@@ -102,7 +106,8 @@ class RunPodAPI:
             f"{API}{path}", method=method,
             data=json.dumps(body).encode() if body is not None else None,
             headers={"Authorization": f"Bearer {self.key}",
-                     "Content-Type": "application/json"})
+                     "Content-Type": "application/json",
+                     "User-Agent": USER_AGENT})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
