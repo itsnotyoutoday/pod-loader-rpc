@@ -32,6 +32,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -159,10 +160,18 @@ GPU_TYPES = ("NVIDIA RTX A4000", "NVIDIA RTX A4500", "NVIDIA RTX A5000",
              "NVIDIA GeForce RTX 4090")
 
 
+#: RunPod's wording for a full rack has changed at least once ("no longer any instances",
+#: "no instances available", now "There are no instances currently available"). Matched
+#: loosely and case-blind, because a miss here is not a soft failure: the first full shape
+#: raises out of the walk, nothing else is tried, and the job is marked not retryable.
+_CAPACITY = re.compile(r"no (longer )?(any )?instances?( are)?( currently)? available"
+                       r"|no longer any instances", re.I)
+
+
 def _is_capacity_error(exc) -> bool:
     """RunPod reports a full rack as HTTP 500, indistinguishable from a real server error
     unless you read the body."""
-    return "no longer any instances" in str(exc) or "no instances available" in str(exc)
+    return bool(_CAPACITY.search(str(exc)))
 
 
 class TooExpensive(RuntimeError):
