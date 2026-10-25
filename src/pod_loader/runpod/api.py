@@ -186,7 +186,8 @@ class RunPodAPI:
                allowed_cuda_versions: list[str] | None = None,
                min_ram_per_gpu: int | None = None,
                min_vcpu_per_gpu: int | None = None,
-               data_center_ids: list[str] | None = None) -> dict:
+               data_center_ids: list[str] | None = None,
+               volume_in_gb: int | None = None) -> dict:
         """Provision a pod. THIS STARTS BILLING.
 
         `gpu_type_ids` is a preference list — RunPod picks the first with capacity, which
@@ -244,6 +245,14 @@ class RunPodAPI:
             body["ports"] = ports
         if network_volume_id:
             body["networkVolumeId"] = network_volume_id
+            body["volumeMountPath"] = volume_mount_path
+        elif volume_in_gb:
+            # Without a network volume, volume_mount_path (/workspace) is the pod's own
+            # volume, and RunPod sizes that at 20 GB unless told otherwise. A workload that
+            # stages models there (Wan 2.2 alone is ~38 GB) fills it and dies with "No space
+            # left on device" while billing; container_disk_gb does not help, it is a
+            # different disk.
+            body["volumeInGb"] = int(volume_in_gb)
             body["volumeMountPath"] = volume_mount_path
         if registry_auth_id:
             body["containerRegistryAuthId"] = registry_auth_id

@@ -50,6 +50,13 @@ try:
 except TypeError:
     check("an unknown key still fails", True)
 
+api.create(name="n", image="i", volume_in_gb=100)
+b = sent["body"]
+check("pod volume is sized when asked", b.get("volumeInGb") == 100 and b.get("volumeMountPath") == "/workspace")
+api.create(name="n", image="i", network_volume_id="v", volume_in_gb=100)
+b = sent["body"]
+check("a network volume wins over a pod volume size", "volumeInGb" not in b and b.get("networkVolumeId") == "v")
+
 check("REST calls carry a named User-Agent", USER_AGENT and "urllib" not in USER_AGENT.lower())
 
 print(f"\n  {sum(ok)}/{len(ok)} passed")
