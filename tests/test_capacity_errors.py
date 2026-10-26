@@ -22,6 +22,7 @@ full = [
     "HTTP 500 POST /pods: There are no longer any instances available with the requested specifications",
     "HTTP 500 POST /pods: no instances available",
     "NO INSTANCES AVAILABLE",
+    'HTTP 500 POST /pods: {"error":"create pod: This machine does not have the resources to deploy your pod. Please try a different machine","status":500}',
 ]
 real = [
     'HTTP 400 POST /pods: {"error":"invalid imageName"}',
