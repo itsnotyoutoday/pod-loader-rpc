@@ -213,7 +213,7 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
                          flavors=FLAVORS, gpu_types=GPU_TYPES,
                          clouds=("SECURE", "COMMUNITY"), fallback_to_gpu: bool = False,
                          max_cost_hr: float = 0.0, verbose: bool = True,
-                         on_attempt=None):
+                         on_attempt=None, skip=()):
     """Create a pod, walking placements until one is available AND affordable.
 
     There is no way to ASK RunPod whether a shape is free — no dry run, no availability
@@ -229,6 +229,13 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
     Called as `on_attempt(label, outcome, cost_hr, detail)` once per placement tried, where
     outcome is `full`, `too_dear` or `placed`. Optional, and failures in it are swallowed:
     a caller that wants to RECORD the walk must not be able to break the walk.
+
+    ## skip
+
+    Labels to pass over, reported as outcome `skipped`. RunPod cannot be told to avoid a
+    machine, only a shape, and RunPod hands the same broken host back for the same shape:
+    a pod whose container never started was placed on that host twice in a row. Skipping
+    the shape for a while is the only way to land somewhere else.
 
     This exists because the walk is the most informative thing that happens here and it was
     being destroyed. Up to twelve combinations get probed, and the only trace was a rendered
@@ -247,10 +254,15 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
                 print(f"  [capacity] on_attempt raised, ignored: "
                       f"{type(exc).__name__}: {exc}", flush=True)
 
-    tried, too_dear = [], []
+    tried, too_dear, skipped = [], [], []
+    skip = set(skip or ())
     for place in placements(compute=compute, flavors=flavors, gpu_types=gpu_types,
                             clouds=clouds, fallback_to_gpu=fallback_to_gpu):
         label = place.pop("_label")
+        if label in skip:
+            skipped.append(label)
+            _note(label, "skipped", 0.0, "on cooldown")
+            continue
         kw = {**create_kwargs, **place}
         try:
             pod = api.create(**kw)
@@ -286,6 +298,8 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
     msg = "no acceptable placement.\n"
     if tried:
         msg += f"  full: {', '.join(tried)}\n"
+    if skipped:
+        msg += f"  skipped (on cooldown): {', '.join(skipped)}\n"
     if too_dear:
         msg += (f"  available but over the ${max_cost_hr}/hr ceiling: "
                 f"{', '.join(too_dear)}\n"
