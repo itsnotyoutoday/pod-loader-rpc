@@ -212,7 +212,13 @@ class RunPodAPI:
             "imageName": image,
             "containerDiskInGb": container_disk_gb,
             "cloudType": cloud_type,
-            "env": env or {},
+            # PODH_GPU_COUNT tells the pod how many GPUs it was rented with, 0 for CPU. Set
+            # HERE, where the compute type is final, and not where the env is composed: a
+            # capacity walk can fall back from CPU to GPU after the env was built, so only
+            # the create call knows which one this pod actually is. A pod that checks its
+            # GPU before doing work needs to know when there is none to check.
+            "env": {**(env or {}),
+                    "PODH_GPU_COUNT": str(0 if compute_type == "CPU" else int(gpu_count))},
         }
         if compute_type == "CPU":
             # Every stage here is CPU: ffmpeg, MFA (Kaldi), librosa/pyin, and a CPU-only

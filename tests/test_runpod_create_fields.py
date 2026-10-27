@@ -59,5 +59,11 @@ check("a network volume wins over a pod volume size", "volumeInGb" not in b and 
 
 check("REST calls carry a named User-Agent", USER_AGENT and "urllib" not in USER_AGENT.lower())
 
+# The pod is told how many GPUs it was rented with, so it can skip a GPU check on a CPU pod.
+api.create(name="n", image="i", gpu_type_ids=["X"], gpu_count=2, env={"A": "1"})
+check("a GPU pod gets PODH_GPU_COUNT", sent["body"]["env"] == {"A": "1", "PODH_GPU_COUNT": "2"})
+api.create(name="n", image="i", compute_type="CPU", env={"PODH_GPU_COUNT": "7"})
+check("a CPU pod gets 0, whatever the env said", sent["body"]["env"]["PODH_GPU_COUNT"] == "0")
+
 print(f"\n  {sum(ok)}/{len(ok)} passed")
 sys.exit(0 if all(ok) else 1)
