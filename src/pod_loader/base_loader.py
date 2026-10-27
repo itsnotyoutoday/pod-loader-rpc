@@ -351,6 +351,52 @@ def _pinned_context(cfg):
     return ctx
 
 
+def pin_mismatch(der: bytes, want: str) -> str:
+    """Why a certificate fails a sha256 pin, or "" when it matches."""
+    import hashlib
+    want = (want or "").replace(":", "").lower()
+    got = hashlib.sha256(der or b"").hexdigest()
+    if got == want:
+        return ""
+    return (f"pod-control certificate does not match the pinned fingerprint.\n"
+            f"  expected {want[:24]}…\n  got      {got[:24]}…")
+
+
+def pinned_ssl_context(fingerprint: str):
+    """An SSLContext that admits exactly one certificate, checked INSIDE the handshake.
+
+    Built on `_pinned_context`, which checks the pin after the response arrives — by then
+    the request, token header included, has already gone out. Here the socket class itself
+    compares the peer certificate the moment the handshake completes and raises before a
+    single byte of the request is written. Works for any client that wraps sockets through
+    the context (urllib, httpx), plain or via `wrap_bio`. None when no pin is given.
+    """
+    import ssl
+
+    ctx = _pinned_context(type("Pin", (), {"control_fingerprint": fingerprint})())
+    if ctx is None:
+        return None
+
+    def check(sock):
+        why = pin_mismatch(sock.getpeercert(binary_form=True), ctx._podh_expected)
+        if why:
+            raise ssl.SSLError(why)
+
+    class _PinnedSocket(ssl.SSLSocket):
+        def do_handshake(self, *a, **kw):
+            super().do_handshake(*a, **kw)
+            check(self)
+
+    class _PinnedObject(ssl.SSLObject):
+        def do_handshake(self):
+            super().do_handshake()
+            check(self)
+
+    ctx.sslsocket_class = _PinnedSocket
+    ctx.sslobject_class = _PinnedObject
+    return ctx
+
+
 def _verify_pin(response, ctx) -> None:
     """Confirm the certificate actually served matches the pin, after connecting."""
     import hashlib
