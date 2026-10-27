@@ -15,6 +15,9 @@ one that runs the whole API in memory.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
+import json as _json
+import re
 from typing import Any, Iterable, Optional, Union
 from urllib.parse import quote
 
@@ -104,6 +107,38 @@ def _model_item(m) -> Union[str, dict]:
     if hasattr(m, "to_dict"):
         return m.to_dict()
     raise TypeError(f"a model is a path or a {{path, sha256, size}} dict, not {type(m).__name__}")
+
+
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_REPO = re.compile(r"^https://github\.com/([^/]+)/(.+?)(?:\.git)?/?$")
+
+
+def canonical_addon_item(it: dict) -> dict:
+    """An addon item as the server stores it (pod-control addons.validate_items): every
+    key present with its default, the repo as https://github.com/<owner>/<repo>, the
+    commit lower-case. Unknown keys are kept, so they still count as a difference."""
+    it = dict(it or {})
+    repo = str(it.get("repo") or "")
+    m = _REPO.match(repo)
+    out = {**it,
+           "name": it.get("name"),
+           "repo": f"https://github.com/{m.group(1)}/{m.group(2)}" if m else repo,
+           "commit": str(it.get("commit") or "").lower(),
+           "pip": list(it.get("pip") or []),
+           "requirements": it.get("requirements", True),
+           "links": [{"file": (ln or {}).get("file"), "to": (ln or {}).get("to")}
+                     for ln in it.get("links") or []],
+           "probe": it.get("probe") or "",
+           "optional": bool(it.get("optional", False)),
+           "note": it.get("note") or ""}
+    return out
+
+
+def addon_items_hash(items: list) -> str:
+    """sha256 of the canonical items as sorted-key JSON."""
+    doc = [canonical_addon_item(it) for it in items]
+    return hashlib.sha256(_json.dumps(doc, sort_keys=True, separators=(",", ":"))
+                          .encode()).hexdigest()
 
 
 class Client:
@@ -288,6 +323,31 @@ class Client:
         if note:
             body["note"] = note
         return int(self._req("PUT", self._set_path(lane, name), json=body)["version"])
+
+    def addon_put_if_changed(self, lane: str, name: str, items: list, note: str = "") -> dict:
+        """PUT the set only when its content differs from the latest version.
+
+        Both sides are compared in the server's normalised form (every item key present
+        with its default, repo without `.git`, commit lower-case), and a short commit pin
+        counts as equal to the full SHA the server resolved it to when that SHA starts
+        with it. Item order is significant (it is install order). `note` is not compared.
+        Returns `{"version", "changed"}`."""
+        try:
+            latest = self.addon_get(lane, name)
+        except NotFound:
+            latest = None
+        if latest is not None:
+            have = [canonical_addon_item(it) for it in latest.get("items") or []]
+            want = [canonical_addon_item(it) for it in items]
+            by_name = {it["name"]: it for it in have}
+            for it in want:
+                old = by_name.get(it["name"])
+                if (old and old["repo"] == it["repo"] and not _FULL_SHA.match(it["commit"])
+                        and it["commit"] and old["commit"].startswith(it["commit"])):
+                    it["commit"] = old["commit"]
+            if addon_items_hash(want) == addon_items_hash(have):
+                return {"version": int(latest["version"]), "changed": False}
+        return {"version": self.addon_put(lane, name, items, note=note), "changed": True}
 
     def addon_export(self, lane: str, name: str) -> str:
         """The set as a file to commit into the app's repo (the server's text, verbatim)."""

@@ -49,7 +49,9 @@ then 30 min), addon sets with validation and short-pin resolution, events with `
 - `pod.boot` events are rate-limited as specified (one per 10 s per job, or a stage
   change); every line is still kept on the job (last 200).
 - Short commit pins resolve against `fake.known_commits` ({repo: [full shas]}), standing
-  in for GitHub. Unknown or ambiguous → 422 naming the item.
+  in for GitHub. Unknown or ambiguous → 422 naming the item. Stored items take the
+  server's normalised shape (all of name, repo without `.git`, commit, pip,
+  requirements, links, probe, optional, note).
 - `boot.addons` with a `set` must carry a `version` (the spec's rule "outside test pods";
   the fake has no test pods).
 - A resume that gets no GPU is not timed: the test calls `resume_without_gpu()`, which
@@ -1029,8 +1031,8 @@ class FakeControl:
         if not NAME_RE.match(name) or name in (".", ".."):
             raise _HTTPError(422, f"bad set name {name!r}")
         items = body.get("items")
-        if not isinstance(items, list):
-            raise _HTTPError(422, "items must be a list")
+        if not isinstance(items, list) or not items:
+            raise _HTTPError(422, "items must be a non-empty list")
         out = []
         for i, it in enumerate(items):
             label = f"item {i} ({it.get('name') if isinstance(it, dict) else it!r})"
@@ -1059,9 +1061,15 @@ class FakeControl:
                     v = v[len("comfy:"):] if k == "to" and v.startswith("comfy:") else v
                     if not v or v.startswith("/") or ".." in v.split("/"):
                         raise _HTTPError(422, f"{label}: link {k} {v!r} leaves its root")
-            out.append({**it, "commit": commit,
+            m = re.match(r"^https://github\.com/([^/]+)/(.+?)(?:\.git)?/?$", it["repo"])
+            out.append({"name": nm, "repo": f"https://github.com/{m.group(1)}/{m.group(2)}",
+                        "commit": commit, "pip": list(it.get("pip") or []),
                         "requirements": it.get("requirements", True),
-                        "optional": bool(it.get("optional", False))})
+                        "links": [{"file": ln.get("file"), "to": ln.get("to")}
+                                  for ln in it.get("links") or []],
+                        "probe": it.get("probe") or "",
+                        "optional": bool(it.get("optional", False)),
+                        "note": it.get("note") or ""})
         versions = self.addon_sets.setdefault((lane, name), [])
         v = {"lane": lane, "name": name, "version": len(versions) + 1, "items": out,
              "note": body.get("note") or "", "by": "master" if who is None else ",".join(who),
