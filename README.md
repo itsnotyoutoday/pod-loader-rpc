@@ -449,6 +449,36 @@ fake.task_done(task, True, result={"frames": 81})
 assert pc.task(task)["state"] == "succeeded"
 ```
 
+#### Timelines, statistics and pod logs
+
+Every job carries a timeline (the placement walk, image pull, each boot stage, ready,
+busy/idle, the end, cost), and pod-control aggregates them. Times are epoch seconds,
+ISO-8601 or a `datetime`; the server's window defaults to the last 7 days.
+
+```python
+pc.job_timeline(job)["boot_total_s"]           # GET /v1/jobs/{id} → timeline
+pc.boot_stats(lane="render", group_by="gpu")   # success rate, p50/p90 per stage, failures
+pc.boot_stats_raw(since=week_ago, limit=500)   # the timelines themselves (parsed JSON lines)
+pc.task_stats(pool="gpu", group_by="kind")     # outcomes, queued/run percentiles, cost per task
+pc.spend_stats(group_by="day")                 # {rows: [{key, usd, run_usd, park_usd, pod_hours}]}
+```
+
+pod-control never connects into a pod, so logs are asked for: the request rides the pod's
+next heartbeat reply (and lapses after 10 min), the pod pushes its tails, and the app
+reads the latest tail per log name. Full logs uploaded at the pod's end (when the server
+has a log store) come back as presigned links.
+
+```python
+pc.request_logs(job, names=["workload"], lines=200)
+pc.logs(job)                                   # {"logs": [{name, at, lines, truncated}], "pending"}
+pc.log_download_url(job, "workload")           # presigned GET of workload.log.gz
+```
+
+In tests: `fake.log_request(job)` (what the pod would be told), `fake.push_logs(job,
+"workload", lines)` (the pod answers), `fake.log_store = "logs"` with
+`fake.upload_logs(job, ["workload"])`. The fake's stats aggregate its own jobs, tasks and
+spend; its docstring lists what its timelines leave out (no busy/idle split, no MB/s).
+
 ### What reaches a pod, and what never does
 
 | | goes to the pod? |
