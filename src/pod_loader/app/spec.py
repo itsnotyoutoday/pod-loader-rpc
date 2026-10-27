@@ -152,7 +152,7 @@ class TaskSpec(_Spec):
     needs: Optional[Needs] = None
     after: Optional[list] = None            # task ids that must succeed first
     workflow: Optional[dict] = None         # {"ref", "inline", "patch", "map"}
-    inputs: Optional[dict] = None           # name -> store:// | https:// | {"task", "artifact"|"result"}
+    inputs: Optional[dict] = None           # name -> store:// | https:// | {"ref", "sha256"?, "size"?} | {"task", "artifact"|"result"}
     outputs: Optional[dict] = None          # {"to", "keep", "names"} or {"put_url"}
     payload: Optional[dict] = None          # opaque to pod-control
     labels: Optional[dict] = None

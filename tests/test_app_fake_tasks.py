@@ -346,6 +346,23 @@ fake.task_done(a, True, result={"frames": 81},
 c = fake.claim_task("video", pod="d2")
 check("…then claimed, inputs resolved from the dependency", c["task_id"] == b
       and c["inputs"]["clip"]["url"] == "https://cdn.example/a.mp4" and c["inputs"]["n"] == {"value": 81})
+h = pc.submit_task(TaskSpec(pool="video", kind="comfy", lane="media", inputs={
+    "lora": {"ref": "store://art/sealed/l.seal", "sha256": "AB" * 32, "size": 5},
+    "ext": {"ref": "https://cdn.example/v.wav"}}))
+c = fake.claim_task("video", pod="d2")
+check("a {ref, sha256, size} input: the claim carries url, ref, sha256 and size", c["task_id"] == h
+      and c["inputs"]["lora"]["ref"] == "store://art/sealed/l.seal" and c["inputs"]["lora"]["url"]
+      and c["inputs"]["lora"]["sha256"] == "ab" * 32 and c["inputs"]["lora"]["size"] == 5
+      and c["inputs"]["ext"] == {"url": fake._presign("https://cdn.example/v.wav")})
+fake.task_done(h, True)
+for bad in ({"ref": "store://art/x", "sha256": "zz"}, {"ref": "store://art/x", "md5": "1"},
+            {"ref": "http://x/a"}, {"ref": "store://art/x", "size": -1}):
+    try:
+        pc.submit_task(TaskSpec(pool="video", kind="comfy", lane="media", inputs={"a": bad}))
+        refused = False
+    except Exception as e:
+        refused = "422" in str(e) or getattr(e, "status", None) == 422
+    check(f"a bad {{ref}} input is refused 422: {sorted(bad)}", refused)
 x = pc.submit_task(TaskSpec(pool="video", kind="comfy", lane="media"))
 y = pc.submit_task(TaskSpec(pool="video", kind="comfy", lane="media", after=[x]))
 pc.cancel_task(x)

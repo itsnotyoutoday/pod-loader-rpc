@@ -680,6 +680,12 @@ class TaskFake:
     def _resolve_inputs(self, t: _Task) -> dict:
         out = {}
         for name, ref in t.inputs.items():
+            if isinstance(ref, dict) and "ref" in ref:
+                r = ref["ref"]
+                out[name] = {"url": self._presign(r),
+                             **({"ref": r} if r.startswith("store://") else {}),
+                             **{k: ref[k] for k in ("sha256", "size") if k in ref}}
+                continue
             if isinstance(ref, dict):
                 dep = self.task_rows.get(ref["task"])
                 if dep is None or dep.state != "succeeded":
@@ -1372,7 +1378,25 @@ class TaskFake:
         for name, ref in i.items():
             if not isinstance(name, str) or not INPUT_NAME_RE.match(name):
                 raise _HTTPError(422, f"inputs: {name!r} is not a valid input name")
-            if isinstance(ref, dict):
+            if isinstance(ref, dict) and "ref" in ref:
+                # {ref, sha256?, size?}: a concrete input with its content hash (TASK-API §8.2).
+                _only(ref, {"ref", "sha256", "size"}, f"inputs.{name}")
+                r = ref["ref"]
+                if not (isinstance(r, str) and r.startswith("https://") and len(r) <= 4096):
+                    r = _store_ref(r, f"inputs.{name}.ref")
+                v = {"ref": r}
+                if ref.get("sha256") is not None:
+                    if not isinstance(ref["sha256"], str) or not re.match(r"^[0-9a-fA-F]{64}$",
+                                                                          ref["sha256"]):
+                        raise _HTTPError(422, f"inputs.{name}.sha256 must be 64 hex characters")
+                    v["sha256"] = ref["sha256"].lower()
+                if ref.get("size") is not None:
+                    if isinstance(ref["size"], bool) or not isinstance(ref["size"], int) \
+                            or ref["size"] < 0:
+                        raise _HTTPError(422, f"inputs.{name}.size must be a non-negative integer")
+                    v["size"] = ref["size"]
+                out[name] = v
+            elif isinstance(ref, dict):
                 _only(ref, {"task", "artifact", "result"}, f"inputs.{name}")
                 if ref.get("task") not in after:
                     raise _HTTPError(422, f"inputs.{name}: task {ref.get('task')!r} must be "
