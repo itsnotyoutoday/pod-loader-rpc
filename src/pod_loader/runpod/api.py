@@ -271,6 +271,49 @@ class RunPodAPI:
             body.setdefault("ports", ["22/tcp"])
         return self._call("POST", "/pods", body, timeout=180)
 
+    def stop_pod(self, pod_id: str) -> dict:
+        """Stop a pod and keep its disk. Returns the pod record.
+
+        A stopped pod no longer bills for its GPU but STILL bills for its volume, so this
+        is parking, not an ending; only `terminate()` ends the charge.
+
+        RunPod REST v1: `POST /pods/{podId}/stop`, no body. The reply is documented as the
+        Pod object, but a reply without an `id` (an empty body has been seen on other
+        lifecycle calls) is followed by a GET so the caller always gets a record.
+        """
+        return self._lifecycle(pod_id, "stop")
+
+    def resume_pod(self, pod_id: str, gpu_count: int = 1) -> dict:
+        """Start a stopped pod again on the same machine and disk. Returns the pod record.
+
+        RunPod REST v1: `POST /pods/{podId}/start`. The REST call takes no GPU count, unlike
+        GraphQL's `podResume(input: {podId, gpuCount})`: the pod comes back with the count
+        it was created with. That is our best reading of rest.runpod.io/v1/openapi.json; if
+        RunPod ever accepts a body here, this is the one place to send it.
+
+        `gpu_count` is therefore the MINIMUM the caller needs, checked against the record
+        that comes back. A resumed pod can land with fewer GPUs (none at all, if the
+        machine's cards were rented out while it was stopped); that pod runs and bills, so
+        this raises with the pod id rather than returning it as if it were usable. Pass 0
+        for a CPU pod, or to inspect a short resume yourself. The GPU count on the record
+        can lag the start by a few seconds; a record that does not say is not refused.
+        """
+        rec = self._lifecycle(pod_id, "start")
+        have = facts_from_pod(rec).get("gpu_count")
+        if gpu_count and have is not None and have < gpu_count:
+            raise RuntimeError(
+                f"pod {pod_id} resumed with {have} GPU(s), wanted {gpu_count}; it is "
+                f"running and billing: stop or terminate it")
+        return rec
+
+    def _lifecycle(self, pod_id: str, verb: str) -> dict:
+        if not pod_id:
+            raise ValueError("pod_id required")
+        rec = self._call("POST", f"/pods/{pod_id}/{verb}")
+        if not isinstance(rec, dict) or not rec.get("id"):
+            rec = self.pod(pod_id)
+        return rec
+
     def placement_facts(self, pod_id: str) -> dict:
         """Where RunPod actually put a pod: one GET, parsed by `facts_from_pod`."""
         return facts_from_pod(self.pod(pod_id))
