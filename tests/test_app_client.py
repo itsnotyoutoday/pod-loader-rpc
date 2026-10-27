@@ -246,5 +246,17 @@ check("an empty job id is refused locally", raises(lambda: pc.get(""), ValueErro
 with fake.client() as c2:
     check("Client is a context manager", c2.get("j-a")["job_id"] == "j-a")
 
+# -- GET /v1/gpus ------------------------------------------------------------------------
+_gc = FakeControl().client()
+_rows = _gc.gpus(min_vram_gb=40, datacenter_only=True, max_cost_hr=0.5)
+check("gpus: VRAM floor and data-centre only, in walk order",
+      [r["gpu"] for r in _rows] == ["NVIDIA A40", "NVIDIA L40S"])
+check("gpus: over max_cost_hr is flagged, not dropped",
+      _rows[0]["over_max_cost"] is False and _rows[1]["over_max_cost"] is True)
+check("gpus: consumer cards listed unless datacenter_only",
+      [r["gpu"] for r in _gc.gpus(min_vram_gb=24)][:2] == ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 4090"])
+
 print(f"\n  {sum(ok)}/{len(ok)} passed")
+
 sys.exit(0 if all(ok) else 1)
+

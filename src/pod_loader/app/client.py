@@ -235,6 +235,26 @@ class Client:
             raise ValueError("lane required")
         return self._req("GET", f"/v1/lanes/{quote(lane, safe='')}/spend")
 
+    def gpus(self, *, min_vram_gb: Optional[float] = None, clouds: Optional[list] = None,
+             datacenter_only: Optional[bool] = None, max_cost_hr: Optional[float] = None,
+             types: Optional[list] = None) -> list:
+        """The cards a submit with these `gpu` fields would try, in the order it would try
+        them: `[{"gpu", "gpu_type_id", "vram_gb", "datacenter", "cost_hr", ...}]`.
+        `cost_hr` is a catalogue estimate, not a live price; the walk checks each pod's
+        real price against `max_cost_hr` after placing it."""
+        params: dict = {}
+        if min_vram_gb is not None:
+            params["min_vram_gb"] = min_vram_gb
+        if clouds:
+            params["clouds"] = ",".join(clouds)
+        if datacenter_only is not None:
+            params["datacenter_only"] = "true" if datacenter_only else "false"
+        if max_cost_hr is not None:
+            params["max_cost_hr"] = max_cost_hr
+        if types:
+            params["types"] = ",".join(types)
+        return self._req("GET", "/v1/gpus", params=params).get("gpus", [])
+
     def events(self, since_seq: int = 0, wait: float = 0, *, job_id: str = "",
                kind: str = "", limit: Optional[int] = None) -> dict:
         """`{"events", "next_seq", "last_seq", "truncated"}`. `wait` > 0 long-polls (≤ 60 s);

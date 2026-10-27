@@ -572,6 +572,33 @@ class FakeControl:
                     self._emit("pod.draining", x, detail={"reason": "budget"})
                     self._settle(x)
 
+    # =================================================================== gpus
+
+    #: A small stand-in catalogue, cheapest-capable first. Tests may replace `fake.gpus`.
+    gpus = [
+        {"gpu": "NVIDIA RTX A5000", "gpu_type_id": "NVIDIA RTX A5000", "vram_gb": 24, "datacenter": True, "cost_hr": 0.27},
+        {"gpu": "NVIDIA GeForce RTX 4090", "gpu_type_id": "NVIDIA GeForce RTX 4090", "vram_gb": 24, "datacenter": False, "cost_hr": 0.69},
+        {"gpu": "NVIDIA A40", "gpu_type_id": "NVIDIA A40", "vram_gb": 48, "datacenter": True, "cost_hr": 0.44},
+        {"gpu": "NVIDIA L40S", "gpu_type_id": "NVIDIA L40S", "vram_gb": 48, "datacenter": True, "cost_hr": 0.86},
+    ]
+
+    def _gpus(self, q: dict) -> list:
+        """The real server lists the walk order from its catalogue; the fake filters its
+        stand-in list the same way (VRAM floor, data-centre only, explicit types) and
+        flags, rather than drops, cards over `max_cost_hr`."""
+        min_vram = float(q.get("min_vram_gb") or 0)
+        dc_only = str(q.get("datacenter_only", "")).lower() in ("1", "true", "yes")
+        types = [t for t in (q.get("types") or "").split(",") if t]
+        cap = float(q["max_cost_hr"]) if q.get("max_cost_hr") else None
+        rows = [dict(g) for g in self.gpus
+                if g["vram_gb"] >= min_vram and (g["datacenter"] or not dc_only)]
+        if types:
+            rows = [g for t in types for g in rows if g["gpu_type_id"] == t]
+        for g in rows:
+            if cap is not None:
+                g["over_max_cost"] = g["cost_hr"] is not None and g["cost_hr"] > cap
+        return rows
+
     # =================================================================== spend
 
     def _spend(self, lane: str) -> dict:
@@ -710,6 +737,9 @@ class FakeControl:
                       "resume": self._resume_req, "models": self._models}.get(p[2])
                 if op:
                     return op(j, body), 200
+        if p == ["gpus"] and m == "GET":
+            return {"gpus": self._gpus(q),
+                    "note": "cost_hr is a catalogue estimate, not a live price"}, 200
         if len(p) == 3 and p[0] == "lanes" and p[2] == "spend" and m == "GET":
             if not self._may(who, p[1]):
                 raise _HTTPError(403, f"this token may not read lane {p[1]!r}")
