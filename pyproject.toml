@@ -25,6 +25,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# pod_loader.app: the client for pod-control's app API, and its in-memory fake.
+app = ["httpx>=0.27"]
 
 [project.scripts]
 runctl = "runctl:main"
