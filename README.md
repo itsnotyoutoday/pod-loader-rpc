@@ -366,6 +366,53 @@ Read the required env set from the contract rather than hardcoding it: when the 
 starts needing a new root, launches fail while composing instead of the pod refusing to
 boot.
 
+### App client
+
+`pod_loader.app` is a typed client for pod-control's app API (`POST /v1/jobs` with a boot
+spec and policy, then read, drain, warm, park, resume, add models, spend, events, addon
+sets). Install with `pip install "pod-loader-rpc[app]"` (adds httpx). Times are seconds
+everywhere; errors raise `AppAPIError` subclasses carrying the server's own text.
+
+```python
+from pod_loader.app import Boot, Client, Gpu, JobSpec, Policy
+
+spec = JobSpec(
+    lane="render", image="registry.example/worker:1", ports=["8188/http"],
+    gpu=Gpu(count=1, min_vram_gb=24, datacenter_only=True),
+    boot=Boot(models=Boot.models_from("my-models", ["checkpoints/a.safetensors"]),
+              addons={"set": "nodes", "version": 3}),
+    policy=Policy(idle_stop_s=300, park_ttl_s=3600, max_life_s=4 * 3600),
+    reuse="parked-first", idempotency_key="render-batch-42")
+
+with Client("https://203.0.113.5:8443", token, fingerprint=cert_sha256) as pc:
+    job = pc.submit(spec)
+    pc.get(job)["state"]                       # queued → placing → booting → ready …
+    pc.add_models(job, ["loras/b.safetensors"])
+    pc.warm(job, delta_s=900)                  # hold it warm 15 min longer
+    pc.drain(job)
+```
+
+`fingerprint` pins pod-control's certificate and is checked inside the TLS handshake, so
+the token is never sent to anything else.
+
+For an app's own tests, `pod_loader.app.testing.FakeControl` runs the whole API in memory
+with a manual clock and hooks that play the pod and the dispatcher:
+
+```python
+from pod_loader.app.testing import FakeControl
+
+fake = FakeControl()
+pc = fake.client()                             # Client(..., transport=fake.transport)
+job = pc.submit(spec)
+fake.place(job); fake.ready(job)
+fake.set_busy(job, True); fake.set_busy(job, False)
+fake.advance(300)                              # idle_stop_s passes
+assert pc.get(job)["state"] == "parked"
+```
+
+It is a test double: its docstring lists what it simplifies (placement is manual,
+`wait` never blocks, flat parking rate, …).
+
 ### What reaches a pod, and what never does
 
 | | goes to the pod? |
