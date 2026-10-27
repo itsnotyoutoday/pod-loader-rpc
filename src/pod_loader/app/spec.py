@@ -112,3 +112,59 @@ def spec_dict(spec) -> dict:
     if hasattr(spec, "to_dict"):
         return spec.to_dict()
     raise TypeError(f"a job spec is a JobSpec or a dict, not {type(spec).__name__}")
+
+
+# -- tasks (docs/TASK-API.md, `POST /v1/tasks`) ----------------------------------------------
+
+@dataclass
+class Needs(_Spec):
+    """`needs`: what a pod must have to claim the task.
+
+    `models` are paths or `{"path", "sha256"?, "size"?, "source"?}` dicts; a `source`
+    (`https://`, `hf://`, `civitai://`) lets pod-control seed a file its store lacks.
+    `addons`, when given, must equal the pool template's `boot.addons`. `loads` is the
+    affinity list (`["ckpt:<id>", "wf:<id>"]`, the first entry weighted x2)."""
+    min_vram_gb: Optional[float] = None
+    models: Optional[list] = None
+    addons: Optional[dict] = None
+    nvenc: Optional[bool] = None
+    loads: Optional[list] = None
+    fits_window_s: Optional[float] = None
+    extra: dict = field(default_factory=dict)
+
+
+@dataclass
+class TaskSpec(_Spec):
+    """A whole `POST /v1/tasks` body. `lane` may be left out for a token confined to one
+    lane. Server defaults when unset: priority 0, deadline_s 86400, max_attempts 2,
+    lease_s 180, timeout_s 1800 (0 = none for a pool with no workload), max_releases 5."""
+    pool: str
+    kind: str                               # "comfy" or "<app>.<handler>"
+    lane: Optional[str] = None
+    task_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    priority: Optional[int] = None          # higher first; FIFO within a priority
+    deadline_s: Optional[float] = None      # expire if not claimed by then
+    max_attempts: Optional[int] = None
+    lease_s: Optional[float] = None
+    timeout_s: Optional[float] = None
+    max_releases: Optional[int] = None
+    needs: Optional[Needs] = None
+    after: Optional[list] = None            # task ids that must succeed first
+    workflow: Optional[dict] = None         # {"ref", "inline", "patch", "map"}
+    inputs: Optional[dict] = None           # name -> store:// | https:// | {"task", "artifact"|"result"}
+    outputs: Optional[dict] = None          # {"to", "keep", "names"} or {"put_url"}
+    payload: Optional[dict] = None          # opaque to pod-control
+    labels: Optional[dict] = None
+    fallback: Optional[str] = None          # "app": never launches, ends `returned`
+    fallback_after_s: Optional[float] = None
+    extra: dict = field(default_factory=dict)
+
+
+def task_dict(spec) -> dict:
+    """A TaskSpec or an already-built dict, as the JSON body."""
+    if isinstance(spec, dict):
+        return _clean(spec)
+    if hasattr(spec, "to_dict"):
+        return spec.to_dict()
+    raise TypeError(f"a task spec is a TaskSpec or a dict, not {type(spec).__name__}")

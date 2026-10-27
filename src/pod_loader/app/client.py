@@ -1,4 +1,5 @@
-"""Client for the pod-control app API (docs/APP-API.md r3, §2).
+"""Client for the pod-control app API (docs/APP-API.md r3, §2) and its Task API
+(docs/TASK-API.md: pools and tasks).
 
 One method per endpoint, plain dicts back (the API's own JSON), and one exception family
 whose message is the server's own error text. Authentication is the `X-Podh-Token` header.
@@ -23,7 +24,7 @@ except ImportError:                      # pragma: no cover - depends on the env
     import httpx2 as httpx               # type: ignore[no-redef]
 
 from ..base_loader import pinned_ssl_context
-from .spec import spec_dict
+from .spec import spec_dict, task_dict
 
 TOKEN_HEADER = "X-Podh-Token"
 
@@ -291,3 +292,161 @@ class Client:
     def addon_export(self, lane: str, name: str) -> str:
         """The set as a file to commit into the app's repo (the server's text, verbatim)."""
         return self._req("GET", self._set_path(lane, name) + "/export", raw=True)
+
+    # -- task pools (TASK-API §2, §9.4) ------------------------------------------------
+
+    @staticmethod
+    def _pool_path(lane: str, name: str) -> str:
+        if not lane or not name:
+            raise ValueError("lane and name required")
+        return f"/v1/pools/{quote(lane, safe='')}/{quote(name, safe='')}"
+
+    def pools(self) -> list:
+        """`GET /v1/pools`: `[{"lane", "name", "version", "updated_ts"}]` this token sees."""
+        return self._req("GET", "/v1/pools").get("pools", [])
+
+    def pool_put(self, lane: str, name: str, job, scale: Optional[dict] = None,
+                 match: Optional[dict] = None, cost_share: Optional[dict] = None) -> int:
+        """Create or replace a pool. `job` is an APP-API submit body (a JobSpec or dict)
+        without `job_id`/`idempotency_key`; `scale` is `{"min_pods", "max_pods",
+        "launch_when": {"queued_s", "queued_tasks"}, "prelaunch", "never_launch",
+        "tasks_per_pod"}`; `match` is `{"affinity_wait_s", "accepts_from"}`. `cost_share`
+        (`{kind: weight}`) is folded into `scale`. Returns the new version."""
+        body: dict = {"job": spec_dict(job)}
+        sc = dict(scale or {})
+        if cost_share is not None:
+            sc["cost_share"] = dict(cost_share)
+        if sc:
+            body["scale"] = sc
+        if match:
+            body["match"] = dict(match)
+        return int(self._req("PUT", self._pool_path(lane, name), json=body)["version"])
+
+    def pool_get(self, lane: str, name: str) -> dict:
+        """`{"version", "job", "scale", "match", "queued", "held", "claimed", "running",
+        "pods": [...], "spend", "expect", "expect_cooldown_until", "last_error"}`."""
+        return self._req("GET", self._pool_path(lane, name))
+
+    def pool_expect(self, lane: str, name: str, in_s: float = 0, tasks: int = 1,
+                    needs: Optional[dict] = None) -> dict:
+        """A pre-launch hint (`scale.prelaunch` pools only, else Conflict). During a
+        wrong-hint cooldown the reply is `{"accepted": False, "cooldown_until"}`, not an
+        error."""
+        body: dict = {"in_s": in_s, "tasks": int(tasks)}
+        if needs:
+            body["needs"] = needs.to_dict() if hasattr(needs, "to_dict") else dict(needs)
+        return self._req("POST", self._pool_path(lane, name) + "/expect", json=body)
+
+    def pool_stats(self, lane: str, name: str, *, kind: str = "",
+                   since: Union[float, int, _dt.datetime, None] = None) -> dict:
+        """Per-kind counts and wall percentiles (queued_s, held_s, run_s) since `since`
+        (epoch seconds or a datetime; the server's default is 7 days)."""
+        if isinstance(since, _dt.datetime):
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=_dt.timezone.utc)
+            since = since.timestamp()
+        return self._req("GET", self._pool_path(lane, name) + "/stats",
+                         params={"kind": kind, "since": since or None})
+
+    # -- tasks (TASK-API §2, §8, §9) ----------------------------------------------------
+
+    @staticmethod
+    def _label(label) -> str:
+        """`"k:v"`, or a one-entry dict, as the API's `label=k:v`."""
+        if label is None or label == "":
+            return ""
+        if isinstance(label, str):
+            if ":" not in label:
+                raise ValueError("a label filter is 'key:value'")
+            return label
+        if isinstance(label, dict):
+            if len(label) != 1:
+                raise ValueError("the server filters on one label; give one key")
+            (k, v), = label.items()
+            return f"{k}:{v}"
+        raise TypeError(f"a label is 'key:value' or {{key: value}}, not {type(label).__name__}")
+
+    @staticmethod
+    def _states(states) -> Optional[str]:
+        if states is None or isinstance(states, str):
+            return states
+        return ",".join(states)
+
+    def submit_task_reply(self, spec) -> dict:
+        """`POST /v1/tasks`: `{"task_id", "state", "lane", "pool", "existing"}`.
+        `existing` is True when the idempotency key matched a task already there."""
+        return self._req("POST", "/v1/tasks", json=task_dict(spec))
+
+    def submit_task(self, spec) -> str:
+        """Queue a task (a TaskSpec or a dict). Returns its task id."""
+        return self.submit_task_reply(spec)["task_id"]
+
+    def task(self, task_id: str) -> dict:
+        """The task record: state, attempt, position, progress, result, artifacts (with
+        fresh presigned urls), error, usage, timings, attempts[]."""
+        return self._req("GET", f"/v1/tasks/{self._id(task_id)}")
+
+    def tasks(self, lane: str = "", pool: str = "",
+              states: Union[str, Iterable[str], None] = None,
+              labels: Union[str, dict, None] = None, limit: Optional[int] = None) -> list:
+        """`GET /v1/tasks`, newest first. The server filters on one label; with a dict of
+        several, the first is sent and the rest are matched here, the server's way
+        (`str(value)` equality)."""
+        rest: dict = {}
+        label = ""
+        if isinstance(labels, dict) and len(labels) > 1:
+            first, *more = labels.items()
+            label = self._label(dict([first]))
+            rest = dict(more)
+        else:
+            label = self._label(labels)
+        out = self._req("GET", "/v1/tasks",
+                        params={"lane": lane, "pool": pool, "state": self._states(states),
+                                "label": label, "limit": limit})
+        rows = out.get("tasks", []) if isinstance(out, dict) else out
+        if rest:
+            rows = [r for r in rows if all(str((r.get("labels") or {}).get(k, "\0")) == str(v)
+                                           for k, v in rest.items())]
+        return rows
+
+    def cancel_task(self, task_id: str, reason: str = "") -> dict:
+        """Cancel from any open state; final (no automatic path requeues it). Cancelling a
+        cancelled task is an idempotent 200 (`already`); any other final state is
+        Conflict."""
+        return self._req("DELETE", f"/v1/tasks/{self._id(task_id)}",
+                         params={"reason": reason})
+
+    def cancel_tasks(self, lane: str = "", label: Union[str, dict, None] = None,
+                     state: Union[str, Iterable[str], None] = None, *,
+                     ids: Optional[Iterable[str]] = None, reason: str = "") -> int:
+        """Bulk cancel: by `ids`, or by `lane` and `label` (optionally narrowed to
+        `state`, default every open state). Returns how many were cancelled."""
+        if ids is not None:
+            body: dict = {"ids": list(ids)}
+            if reason:
+                body["reason"] = reason
+            return int(self._req("POST", "/v1/tasks/cancel", json=body)["cancelled"])
+        lab = self._label(label)
+        if not lane or not lab:
+            raise ValueError("bulk cancel needs ids, or lane and label")
+        return int(self._req("DELETE", "/v1/tasks",
+                             params={"lane": lane, "label": lab,
+                                     "state": self._states(state),
+                                     "reason": reason})["cancelled"])
+
+    def retry_task(self, task_id: str, payload: Optional[dict] = None,
+                   patch: Optional[dict] = None) -> dict:
+        """Run a failed, cancelled, expired or returned task again: same id, attempt 1,
+        and optionally a new payload or workflow patch (a re-roll; `attempts[]` keeps the
+        old payload's hash). `{"task_id", "state", "attempt"}`."""
+        body: dict = {}
+        if payload is not None:
+            body["payload"] = payload
+        if patch is not None:
+            body["patch"] = patch
+        return self._req("POST", f"/v1/tasks/{self._id(task_id)}/retry", json=body)
+
+    def set_priority(self, task_id: str, priority: int) -> dict:
+        """Queued tasks only (else Conflict). `{"task_id", "priority", "position"}`."""
+        return self._req("PATCH", f"/v1/tasks/{self._id(task_id)}",
+                         json={"priority": int(priority)})
