@@ -60,6 +60,56 @@ then 30 min), addon sets with validation and short-pin resolution, events with `
   codes (401 token, 403 lane, 404 job, 409 state, 422 body). Wording is the fake's own.
 - Not implemented: chains, webhooks, `/v1/models/{profile}`, hosts endpoints beyond
   recording blocks in `fake.blocked_hosts`, the pod API (§3) and kits.
+
+## Tasks and pools (docs/TASK-API.md r2 + §9)
+
+    pc.pool_put("media", "video", template, scale={"max_pods": 2})
+    tid = pc.submit_task(TaskSpec(pool="video", kind="comfy", lane="media"))
+    pod = fake.pool_launches("media", "video")[0]["job_id"]   # the autoscaler asked
+    fake.place(pod); fake.ready(pod)
+    task = fake.claim_task("media/video", have_loaded=["ckpt:a"])
+    fake.task_start(tid); fake.task_progress(tid, 0.5)
+    fake.task_done(tid, True, result={...})
+
+Follows: states queued / held / claimed / running / succeeded / failed / cancelled /
+expired / returned. Cancel is final: lease loss, release, a pod that ends, a late beat
+or done never move a cancelled task; only `retry` does. Lease loss and pod end requeue
+at attempt + 1 (failed at max_attempts); release requeues without counting, is never
+offered to the same pod again, and "no handler" counts toward max_releases. Retry keeps
+the id, resets attempt to 1, may replace payload / workflow.patch, and `attempts[]`
+keeps every attempt's payload hash and outcome. Priority, position (per pool), PATCH
+queued-only; bulk cancel by ids or lane+label(+state); deadlines, fallback_after_s,
+timeout_s and leases on the manual clock; `after` dependencies (a dead one fails the
+dependant at stage `after`) and `{"task", "artifact"|"result"}` inputs resolved at
+claim; fallback "app" tasks never cause a launch and end `returned` on any pod-side
+failure or release; `never_launch` pools; `accepts_from` (only while the claiming pod
+holds nothing); claim filters (VRAM, NVENC, addons, model store, fits_window_s) and
+order (priority, affinity score with the first `loads` entry x2, age); missing models
+→ `held` (pod_fetch) and added to the pod's job as mid-life models; seeding holds with
+`fake.seed_done(path)` / `fake.seed_fail(path, error)`; usage with cost_share weights;
+`task.*` events (progress 1/5 s, event 1/s) in the same event log as the jobs, with
+the task id as the event's `job_id`; `pool.scaled` launched/stopped.
+
+Simplifies:
+- The autoscaler runs after every API call and every `advance()` (not on a dispatch
+  timer), so `launch_when.queued_s` is judged at the end of an advance. A launch is a
+  real fake job (labels pool=, lane=) that the test places and readies; nothing else
+  about pods is automatic. `fake.pool_launches(lane, name)` lists the requests.
+- Pod-side hooks act as the pod that holds the task (no per-pod token checks). A pod is
+  a launched job, or a virtual pod named by any other string that never ends.
+  `claim_tasks(pod=None)` picks the pool's first serving pod, else the virtual
+  "<lane>-<name>-pod". Hooks on a task that is not on a pod return the server's reply
+  (`cancel: True` / `accepted: False`) rather than raising.
+- A pod holding a task is busy (its idle clock stops); when it holds none it is not.
+- Equal `queued_at` (the clock does not move between submits) is broken by submit order.
+- `match.affinity_wait_s` is stored but not applied. Store refs are not checked against
+  configured stores; presigned URLs are `https://fake-store.test/...`. Payload retention
+  (purge after PAYLOAD_RETAIN_DAYS) is not modelled. `/v1/pod/tasks/{id}/outputs` and
+  `/sign` are not served; claim views carry `outputs.put` for declared names.
+- `task_artifact(id, name, ref)` with `outputs.to` uses `<to><name>` as the server does;
+  without it, `ref` must be an https url (a store:// ref is accepted leniently).
+- Expect hints are judged at `in_s` + 600 s by the clock; the cooldown doubles per wrong
+  hint (15 min → 4 h). The min_pods warm hold sets `keep_warm_until` on the oldest pods.
 """
 from __future__ import annotations
 
@@ -75,6 +125,8 @@ try:
 except ImportError:                      # pragma: no cover
     import httpx2 as httpx               # type: ignore[no-redef]
 
+from ._fake_errors import FakeError, FakeHeld, _HTTPError  # noqa: F401 (re-exported)
+from ._fake_tasks import TaskFake
 from .client import Client
 
 TERMINAL = ("done", "failed", "cancelled", "expired", "preempted")
@@ -93,19 +145,6 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REPO_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?(\.git)?$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHORT_RE = re.compile(r"^[0-9a-f]{7,39}$")
-
-
-class FakeError(RuntimeError):
-    """A test hook was used in a way the real system could not produce."""
-
-
-class FakeHeld(FakeError):
-    """`place()` on a job the real dispatcher would leave queued."""
-
-
-class _HTTPError(Exception):
-    def __init__(self, status: int, error: str, hint: str = ""):
-        self.status, self.error, self.hint = status, error, hint
 
 
 @dataclass
@@ -147,6 +186,9 @@ class _Job:
     cancelled_in_placement: bool = False
     bill_kind: Optional[str] = None     # "running" | "parked" | None
     bill_since: Optional[float] = None
+    pool: Optional[tuple] = None        # (lane, name) for a pod the pool autoscaler launched
+    pool_version: int = 0
+    pool_noted: bool = False            # its pool.scaled "stopped" was emitted
 
     @property
     def policy(self) -> dict:
@@ -165,7 +207,7 @@ def _path_of(m) -> str:
     return m["path"] if isinstance(m, dict) else str(m)
 
 
-class FakeControl:
+class FakeControl(TaskFake):
     """In-memory pod-control. See the module docstring for what it follows and simplifies.
 
     `token` is a master token; `tokens` maps more tokens to the lanes they are confined
@@ -191,6 +233,7 @@ class FakeControl:
         self._backoff_until: dict = {}   # lane -> ts
         self._breached: set = set()
         self._n = 0
+        self._tasks_init()
         self.transport = httpx.MockTransport(self._handle)
 
     # =================================================================== conveniences
@@ -245,6 +288,7 @@ class FakeControl:
             action(job)
         self.now = target
         self._check_budgets()
+        self._task_pass()
 
     def _next_due(self):
         best = None
@@ -252,6 +296,9 @@ class FakeControl:
             for t, action in self._timers(j):
                 if t is not None and (best is None or t < best[0]):
                     best = (t, j, action)
+        for t, task, action in self._task_timers():
+            if t is not None and (best is None or t < best[0]):
+                best = (t, task, action)
         return best
 
     def _timers(self, j: _Job):
@@ -755,6 +802,8 @@ class FakeControl:
             return self._events(q), 200
         if p and p[0] == "addons":
             return self._addons(m, p[1:], body, who)
+        if p and p[0] in ("pools", "tasks"):
+            return self._task_route(m, p, q, body, who)
         raise _HTTPError(404, f"no route {m} {path}")
 
     # -- jobs ----------------------------------------------------------------------------
