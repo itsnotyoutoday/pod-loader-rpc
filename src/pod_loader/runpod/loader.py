@@ -159,6 +159,12 @@ class RunPodLoader(BaseLoader):
         RunPodAPI().terminate(handle)
         return {"terminated": handle}
 
+    def placement_facts(self, pod, *, wait_sec: float = 30.0) -> dict:
+        """Machine, GPU, datacentre and price for a pod (a create response or an id).
+        See reaper.placement_facts; never raises."""
+        from . import reaper
+        return reaper.placement_facts(reaper._api(), pod, wait_sec=wait_sec)
+
     def list_pods(self) -> list[PodInfo]:
         from .api import RunPodAPI
         return [PodInfo(pod_id=p["id"], name=p.get("name", ""),

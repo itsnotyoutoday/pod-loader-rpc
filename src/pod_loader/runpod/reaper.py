@@ -213,7 +213,7 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
                          flavors=FLAVORS, gpu_types=GPU_TYPES,
                          clouds=("SECURE", "COMMUNITY"), fallback_to_gpu: bool = False,
                          max_cost_hr: float = 0.0, verbose: bool = True,
-                         on_attempt=None, skip=()):
+                         on_attempt=None, skip=(), vet=None, max_refusals=None):
     """Create a pod, walking placements until one is available AND affordable.
 
     There is no way to ASK RunPod whether a shape is free — no dry run, no availability
@@ -227,7 +227,7 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
     ## on_attempt
 
     Called as `on_attempt(label, outcome, cost_hr, detail)` once per placement tried, where
-    outcome is `full`, `too_dear` or `placed`. Optional, and failures in it are swallowed:
+    outcome is `full`, `too_dear`, `skipped`, `refused` or `placed`. Optional, and failures in it are swallowed:
     a caller that wants to RECORD the walk must not be able to break the walk.
 
     ## skip
@@ -236,6 +236,21 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
     machine, only a shape, and RunPod hands the same broken host back for the same shape:
     a pod whose container never started was placed on that host twice in a row. Skipping
     the shape for a while is the only way to land somewhere else.
+
+    ## vet
+
+    `vet(pod) -> str | None`, called once a pod exists and its price is acceptable. A
+    non-empty return refuses it: the pod is terminated at once, noted as outcome `refused`
+    with that string as the detail, and the walk moves on to the next shape. This is how a
+    caller avoids a MACHINE. RunPod chooses the host and cannot be told which ones to skip,
+    so the only possible check is after placement — look at where it landed, and give it
+    back if that host is one the caller already knows is bad.
+
+    `max_refusals` bounds that: after that many refusals in one walk it stops and raises
+    the usual waitable "no acceptable placement", so a datacentre that keeps handing out
+    bad hosts costs a few seconds of billing per walk rather than a loop. None = no bound.
+    A vet that raises is treated as accepting — a broken check must not strand a job, and
+    the caller's own watchdog still applies to whatever was placed.
 
     This exists because the walk is the most informative thing that happens here and it was
     being destroyed. Up to twelve combinations get probed, and the only trace was a rendered
@@ -254,7 +269,7 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
                 print(f"  [capacity] on_attempt raised, ignored: "
                       f"{type(exc).__name__}: {exc}", flush=True)
 
-    tried, too_dear, skipped = [], [], []
+    tried, too_dear, skipped, refused = [], [], [], []
     skip = set(skip or ())
     for place in placements(compute=compute, flavors=flavors, gpu_types=gpu_types,
                             clouds=clouds, fallback_to_gpu=fallback_to_gpu):
@@ -289,6 +304,28 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
                       f"${max_cost_hr}/hr — released", flush=True)
             continue
 
+        why = None
+        if vet is not None:
+            try:
+                why = vet(pod)
+            except Exception as exc:                        # pragma: no cover - defensive
+                if verbose:
+                    print(f"  [capacity] vet raised, accepting: "
+                          f"{type(exc).__name__}: {exc}", flush=True)
+        if why:
+            try:
+                api.terminate(pod["id"])
+            except Exception:
+                pass
+            refused.append(f"{label} ({why})")
+            _note(label, "refused", cost, str(why)[:200])
+            if verbose:
+                print(f"  [capacity] {label} placed on a refused host — released: {why}",
+                      flush=True)
+            if max_refusals is not None and len(refused) >= max_refusals:
+                break
+            continue
+
         _note(label, "placed", cost, "")
         if verbose and tried:
             print(f"  [capacity] got {label} @ ${cost}/hr after {len(tried)} full",
@@ -300,6 +337,8 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
         msg += f"  full: {', '.join(tried)}\n"
     if skipped:
         msg += f"  skipped (on cooldown): {', '.join(skipped)}\n"
+    if refused:
+        msg += f"  placed but refused by the caller: {', '.join(refused)}\n"
     if too_dear:
         msg += (f"  available but over the ${max_cost_hr}/hr ceiling: "
                 f"{', '.join(too_dear)}\n"
@@ -309,6 +348,37 @@ def create_with_capacity(api, create_kwargs: dict, *, compute: str = "CPU",
     msg += ("  A network volume pins compute to its datacenter, so there is no other "
             "region to fall back to. Either wait, or run without a volume.")
     raise TooExpensive(msg) if too_dear and not tried else RuntimeError(msg)
+
+
+def placement_facts(api, pod, *, wait_sec: float = 30.0, interval: float = 3.0,
+                    sleep=time.sleep) -> dict:
+    """Where a pod actually landed — machine, GPU, datacentre, price — waiting briefly for
+    the machine to be assigned. `pod` is a create response or a pod id.
+
+    Bounded on purpose. The machine is normally in the create response already; when it is
+    not, RunPod fills it in within seconds. A caller that needs it to decide whether to keep
+    the pod should not wait longer than it takes a healthy pod to show up anyway, and one
+    that can learn it later (a periodic pass) should pass `wait_sec=0` for a single look.
+
+    Never raises. A failed GET returns what is already known with the rest None: these
+    are facts to record, and failing to record them must not fail a launch.
+    """
+    from .api import facts_from_pod
+
+    pod_id = pod.get("id") if isinstance(pod, dict) else str(pod)
+    facts = facts_from_pod(pod if isinstance(pod, dict) else {"id": pod_id})
+    if facts.get("machine_id"):
+        return facts
+    deadline = time.time() + max(0.0, wait_sec)
+    while True:
+        try:
+            later = facts_from_pod(api.pod(pod_id))
+            facts.update({k: v for k, v in later.items() if v is not None})
+        except Exception:
+            pass
+        if facts.get("machine_id") or time.time() + interval > deadline:
+            return facts
+        sleep(interval)
 
 
 @contextmanager

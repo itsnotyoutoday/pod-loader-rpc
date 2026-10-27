@@ -271,6 +271,10 @@ class RunPodAPI:
             body.setdefault("ports", ["22/tcp"])
         return self._call("POST", "/pods", body, timeout=180)
 
+    def placement_facts(self, pod_id: str) -> dict:
+        """Where RunPod actually put a pod: one GET, parsed by `facts_from_pod`."""
+        return facts_from_pod(self.pod(pod_id))
+
     def terminate(self, pod_id: str) -> dict:
         """Delete the pod and STOP BILLING. Stopping alone still bills for disk."""
         return self._call("DELETE", f"/pods/{pod_id}")
@@ -291,6 +295,54 @@ class RunPodAPI:
         return {"pod_id": pod_id, "status": status, "ip": ip, "port": port,
                 "ready": bool(ip and port),
                 "ssh": f"root@{ip}" if ip else None}
+
+
+#: The keys `facts_from_pod` always returns, so a caller can store them as columns without
+#: checking which ones a given response happened to carry.
+FACT_KEYS = ("pod_id", "machine_id", "gpu_type_id", "gpu_name", "gpu_count",
+             "data_center_id", "cost_hr", "cuda_version", "driver_version")
+
+
+def facts_from_pod(pod: dict) -> dict:
+    """What RunPod placed, read from its REST pod object. Unknown is None, never a guess.
+
+    A create REQUESTS a list of GPU types and lets RunPod choose; what it chose, on which
+    machine, in which datacentre and at what price is only in the pod record afterwards.
+    Without that, "this host keeps renting containers that never start" cannot even be
+    stated — RunPod cannot be told to avoid a machine, so the caller has to recognise one.
+
+    Field names are RunPod's REST v1 Pod object (rest.runpod.io/v1/openapi.json):
+    `machineId`, `machine.gpuTypeId`, `machine.dataCenterId`, `gpu.{id,displayName,count}`,
+    `gpuCount`, `costPerHr`. Each is read defensively because the record is filled in as
+    the pod is scheduled: the create response can lack the machine that a GET a few
+    seconds later has.
+
+    `cuda_version` and `driver_version` are always None here. The REST pod object does not
+    expose the host's CUDA or driver version — `allowedCudaVersions` is a create-time
+    FILTER, not a report — so the only reliable source is the pod itself. The keys exist
+    so callers have one shape to store.
+    """
+    pod = pod if isinstance(pod, dict) else {}
+    machine = pod.get("machine") if isinstance(pod.get("machine"), dict) else {}
+    gpu = pod.get("gpu") if isinstance(pod.get("gpu"), dict) else {}
+    gpu_type = machine.get("gpuType") if isinstance(machine.get("gpuType"), dict) else {}
+    volume = pod.get("networkVolume") if isinstance(pod.get("networkVolume"), dict) else {}
+
+    count = gpu.get("count")
+    if count is None:
+        count = pod.get("gpuCount")
+    cost = pod.get("costPerHr")
+    return {
+        "pod_id": pod.get("id") or None,
+        "machine_id": pod.get("machineId") or None,
+        "gpu_type_id": gpu.get("id") or machine.get("gpuTypeId") or None,
+        "gpu_name": gpu.get("displayName") or gpu_type.get("displayName") or None,
+        "gpu_count": int(count) if count is not None else None,
+        "data_center_id": machine.get("dataCenterId") or volume.get("dataCenterId") or None,
+        "cost_hr": float(cost) if cost not in (None, "") else None,
+        "cuda_version": None,
+        "driver_version": None,
+    }
 
 
 def _public_key() -> str | None:

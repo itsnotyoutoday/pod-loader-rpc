@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pod-loader-rpc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Loads jobs into the lingua harness and drives them over RPC"
 # 3.9 because that is what ships on macOS and what this actually runs on — every module
 # imports under it, since the annotations are all postponed via __future__. Claiming 3.10

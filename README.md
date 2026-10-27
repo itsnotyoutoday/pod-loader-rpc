@@ -295,6 +295,30 @@ into **one** decision — if the only free slot is too expensive, that is a reas
 not a placement. An over-budget pod that does get created is terminated immediately,
 because it bills from the instant it exists.
 
+### Where it landed, and giving a host back
+
+A create asks for a list of GPU types; RunPod picks one, and a machine, and a price. What it
+picked is read back from the pod record:
+
+```python
+from pod_loader.runpod import reaper
+facts = reaper.placement_facts(reaper._api(), pod, wait_sec=30)
+# {"machine_id", "gpu_type_id", "gpu_name", "gpu_count", "data_center_id", "cost_hr",
+#  "cuda_version", "driver_version"}   — None where unknown, never guessed
+```
+
+It waits (bounded) for the machine to be assigned and never raises. `cuda_version` and
+`driver_version` are always None: RunPod's REST pod object does not report them, so only
+the pod itself can. `RunPodLoader.placement_facts(pod)` is the same through the loader.
+
+RunPod cannot be told to avoid a machine, so `create_with_capacity(..., vet=fn,
+max_refusals=n)` checks after placement: `vet(pod)` returning a reason gives the pod back at
+once (outcome `refused`) and the walk moves on, at most `n` times before the usual waitable
+"no acceptable placement".
+
+Every pod's env carries `PODH_GPU_COUNT` — set by `RunPodAPI.create` from the compute type
+it actually requested, `0` for CPU — so a pod can skip its GPU check when it has none.
+
 ### Storage profiles
 
 ```bash
@@ -349,6 +373,7 @@ boot.
 | workload code, job spec | yes — as objects it reads |
 | `PODH_API_TOKEN` | yes — minted per job, for its own `/v1` only |
 | `PODH_CONTROL_TOKEN` | yes — a **per-pod** token, good only for "I am alive" / "I am done" |
+| `PODH_GPU_COUNT` | yes — GPUs the pod was rented with, `0` for CPU |
 | store credentials | only for profiles named in `FORWARD_STORES` |
 | the master control token | **never** |
 | any `*.key` file | **never** |
