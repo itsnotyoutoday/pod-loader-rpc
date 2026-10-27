@@ -61,6 +61,38 @@ then 30 min), addon sets with validation and short-pin resolution, events with `
 - Not implemented: chains, webhooks, `/v1/models/{profile}`, hosts endpoints beyond
   recording blocks in `fake.blocked_hosts`, the pod API (§3) and kits.
 
+## Pod logs, timelines and statistics (APP-API §8.14 and §9, TASK-API §11.5)
+
+    pc.request_logs(job, names=["workload"], lines=100)
+    fake.log_request(job)                # what the pod's /v1/alive reply would carry
+    fake.push_logs(job, "workload", ["line 1", "line 2"])     # the pod answered
+    pc.logs(job)["logs"][0]["lines"]
+    fake.log_store = "logs"; fake.upload_logs(job, ["workload"], sizes={"workload": 123})
+    pc.log_download_url(job, "workload")  # https://fake-store.test/logs/<lane>/<job>/...
+
+Follows: one pending request per job (a new one replaces it), expiring after 10 min of
+fake clock; `lines` 1-2000 and log-name validation (422); 409 for an ended job; tails
+replaced per push and capped at 256 KB (newest lines kept, `truncated` set); a push
+clears the pending request (only the matching one when `req_id` is given); `pod.logs`
+events carry names only; with no `log_store` the download answers 404 `{"error": "no
+log store configured"}`; uploaded refs show in `timeline.logs`.
+
+Simplifies:
+- The pod side is hooks (`log_request`, `push_logs`, `upload_logs`), not the pod API.
+  `upload_logs` raises FakeError when `log_store` is unset (the server answers 404 and
+  the pod skips). Download URLs are `https://fake-store.test/<key>?sig=fake`.
+- `timeline` (on every job view) is built from what the fake tracks: a placement is one
+  attempt that placed (`walk_s` 0) when `place()` was called; stages come from the job's
+  kept boot lines (last 200) with `boot_n` 0, measured only (no `stage_s`, `bytes`,
+  `files`, `mb_s`); `busy_s`, `idle_s`, `parked_s` and `image_digest` are None;
+  `parks`/`resumes` count the job's `pod.parked`/`pod.resumed` events; `gpu` is
+  `place(gpu=)` with a leading "NVIDIA " dropped.
+- `/v1/stats/boots` (and `/raw`), `/tasks` and `/spend` aggregate the fake's own jobs,
+  tasks and spend ledger with the server's grouping, percentiles (nearest rank),
+  filters, defaults (last 7 days of fake clock; `resumed` 0, raw `all`) and 422s. Stage
+  figures have no MB/s. Spend `gpu` is the placed card; `pool` is the pool name or
+  "none"; parked stretches bill `park_cost_hr`.
+
 ## Tasks and pools (docs/TASK-API.md r2 + §9)
 
     pc.pool_put("media", "video", template, scale={"max_pods": 2})
@@ -126,6 +158,7 @@ except ImportError:                      # pragma: no cover
     import httpx2 as httpx               # type: ignore[no-redef]
 
 from ._fake_errors import FakeError, FakeHeld, _HTTPError  # noqa: F401 (re-exported)
+from ._fake_logs_stats import LogsStatsFake
 from ._fake_tasks import TaskFake
 from .client import Client
 
@@ -207,7 +240,7 @@ def _path_of(m) -> str:
     return m["path"] if isinstance(m, dict) else str(m)
 
 
-class FakeControl(TaskFake):
+class FakeControl(TaskFake, LogsStatsFake):
     """In-memory pod-control. See the module docstring for what it follows and simplifies.
 
     `token` is a master token; `tokens` maps more tokens to the lanes they are confined
@@ -234,6 +267,7 @@ class FakeControl(TaskFake):
         self._breached: set = set()
         self._n = 0
         self._tasks_init()
+        self._logs_init()
         self.transport = httpx.MockTransport(self._handle)
 
     # =================================================================== conveniences
@@ -714,7 +748,8 @@ class FakeControl(TaskFake):
                 "last_error": j.last_error, "reason": j.reason, "stage": j.stage,
                 "log_tail": j.log_tail, "cost_so_far": self._cost_so_far(j),
                 "resumed_from": j.resumed_from,
-                "image": j.spec.get("image"), "reuse": j.spec.get("reuse") or "never"}
+                "image": j.spec.get("image"), "reuse": j.spec.get("reuse") or "never",
+                "timeline": self._timeline(j)}
 
     def _get(self, job_id) -> _Job:
         j = self.jobs.get(job_id)
@@ -781,6 +816,10 @@ class FakeControl(TaskFake):
                 return self._view(j), 200
             if len(p) == 2 and m == "DELETE":
                 return self._cancel(j, q.get("reason", "")), 200
+            if len(p) >= 3 and p[2] == "logs":
+                hit = self._logs_route(m, j, p[2:], q, body)
+                if hit is not None:
+                    return hit
             if len(p) == 3 and m == "POST":
                 op = {"drain": self._drain, "warm": self._warm, "park": self._park_req,
                       "resume": self._resume_req, "models": self._models}.get(p[2])
@@ -804,6 +843,8 @@ class FakeControl(TaskFake):
             return self._addons(m, p[1:], body, who)
         if p and p[0] in ("pools", "tasks"):
             return self._task_route(m, p, q, body, who)
+        if len(p) >= 2 and p[0] == "stats":
+            return self._stats_route(m, p[1:], q, who)
         raise _HTTPError(404, f"no route {m} {path}")
 
     # -- jobs ----------------------------------------------------------------------------
