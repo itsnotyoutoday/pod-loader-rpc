@@ -370,7 +370,7 @@ boot.
 
 `pod_loader.app` is a typed client for pod-control's app API (`POST /v1/jobs` with a boot
 spec and policy, then read, drain, warm, park, resume, add models, spend, events, addon
-sets). Install with `pip install "pod-loader-rpc[app]"` (adds httpx). Times are seconds
+sets) and its Task API (pools and tasks, below). Install with `pip install "pod-loader-rpc[app]"` (adds httpx). Times are seconds
 everywhere; errors raise `AppAPIError` subclasses carrying the server's own text.
 
 ```python
@@ -412,6 +412,42 @@ assert pc.get(job)["state"] == "parked"
 
 It is a test double: its docstring lists what it simplifies (placement is manual,
 `wait` never blocks, flat parking rate, …).
+
+#### Tasks
+
+The Task API (pod-control `docs/TASK-API.md`) has the app submit **tasks** to a **pool**
+and lets pod-control launch, feed and stop the pods. A pool is a job template plus scaling
+limits; a task names its pool, a `kind` (`comfy` or an app handler) and what it `needs`.
+
+```python
+from pod_loader.app import Needs, TaskSpec
+
+pc.pool_put("render", "gpu", {"image": "registry.example/worker:1",
+                              "gpu": {"min_vram_gb": 24},
+                              "boot": {"models": {"profile": "my-models", "paths": []}}},
+            scale={"max_pods": 2, "launch_when": {"queued_tasks": 1}})
+task = pc.submit_task(TaskSpec(
+    pool="gpu", kind="comfy", lane="render", idempotency_key="frame-14",
+    needs=Needs(min_vram_gb=24, models=["checkpoints/a.safetensors"], loads=["ckpt:a"]),
+    workflow={"ref": "workflows/i2v.json", "patch": {"12.inputs.seed": 7}},
+    labels={"batch": "42"}))
+pc.task(task)["state"]                         # queued → claimed/held → running → succeeded
+pc.set_priority(task, 10)                      # while queued
+pc.retry_task(task, patch={"12.inputs.seed": 8})   # after a failure: same id, a re-roll
+pc.cancel_tasks(lane="render", label={"batch": "42"})   # final: nothing requeues it
+pc.addon_put_if_changed("render", "nodes", items)       # a new version only if it differs
+```
+
+In tests, the fake plays the pod's worker:
+
+```python
+pod = fake.pool_launches("render", "gpu")[0]["job_id"]   # the autoscaler asked for one
+fake.place(pod); fake.ready(pod)
+claimed = fake.claim_task("render/gpu", have_loaded=["ckpt:a"])
+fake.task_start(task); fake.task_progress(task, 0.5)
+fake.task_done(task, True, result={"frames": 81})
+assert pc.task(task)["state"] == "succeeded"
+```
 
 ### What reaches a pod, and what never does
 
