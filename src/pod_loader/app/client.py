@@ -510,3 +510,117 @@ class Client:
         """Queued tasks only (else Conflict). `{"task_id", "priority", "position"}`."""
         return self._req("PATCH", f"/v1/tasks/{self._id(task_id)}",
                          json={"priority": int(priority)})
+
+    # -- timelines and statistics (APP-API §8.14, TASK-API §11.5) ----------------------
+
+    def job_timeline(self, job_id: str) -> dict:
+        """The job's `timeline` from `GET /v1/jobs/{id}`: the placement walk, pull, each
+        boot stage, ready, busy/idle, parks, the end, cost, and `logs` (uploaded full
+        logs as `[{name, ref, size?}]`)."""
+        return self.get(job_id).get("timeline") or {}
+
+    @staticmethod
+    def _when(v) -> Union[str, float, None]:
+        """`since` / `until` as the server takes them: epoch seconds or ISO-8601."""
+        if v is None or v == "":
+            return None
+        if isinstance(v, _dt.datetime):
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=_dt.timezone.utc)
+            return v.timestamp()
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        if isinstance(v, str):
+            return v
+        raise TypeError(f"a time is epoch seconds, ISO-8601 or a datetime, not {type(v).__name__}")
+
+    def _boot_params(self, lane, image, gpu, data_center, since, until, resumed) -> dict:
+        if resumed is not None:
+            resumed = {True: "1", False: "0"}.get(resumed, str(resumed))
+        return {"lane": lane, "image": image, "gpu": gpu, "data_center": data_center,
+                "since": self._when(since), "until": self._when(until), "resumed": resumed}
+
+    def boot_stats(self, *, lane: str = "", image: str = "", gpu: str = "",
+                   data_center: str = "", since=None, until=None,
+                   resumed: Union[str, bool, None] = None, group_by: str = "") -> dict:
+        """`GET /v1/stats/boots`: `{"since", "until", "group_by", "resumed", "groups":
+        [{key, jobs, n, unplaced, ready, failed, ended_before_ready, booting, success_rate,
+        placement_s, walk_s, pull_s, boot_total_s, stages, failures, cost_usd}], "basis"}`.
+        `group_by` is gpu, image, data_center, lane or pool ("" = one group, "all");
+        `resumed` is "0" (the server's default), "1" or "all" (True/False map to 1/0)."""
+        params = self._boot_params(lane, image, gpu, data_center, since, until, resumed)
+        params["group_by"] = group_by
+        return self._req("GET", "/v1/stats/boots", params=params)
+
+    def boot_stats_raw(self, *, lane: str = "", image: str = "", gpu: str = "",
+                       data_center: str = "", since=None, until=None,
+                       resumed: Union[str, bool, None] = None,
+                       limit: Optional[int] = None) -> list:
+        """`GET /v1/stats/boots/raw`: the timelines themselves (oldest first), parsed from
+        the server's JSON lines. `resumed` defaults to "all" on the server; `limit` ≤ 20000
+        (server default 1000)."""
+        params = self._boot_params(lane, image, gpu, data_center, since, until, resumed)
+        params["limit"] = limit
+        text = self._req("GET", "/v1/stats/boots/raw", params=params, raw=True)
+        out = []
+        for n, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                out.append(_json.loads(line))
+            except ValueError:
+                raise AppAPIError(200, f"line {n} of the raw timelines is not JSON: {line[:200]}",
+                                  method="GET", path="/v1/stats/boots/raw") from None
+        return out
+
+    def task_stats(self, *, lane: str = "", pool: str = "", kind: str = "", since=None,
+                   until=None, group_by: str = "") -> dict:
+        """`GET /v1/stats/tasks`: `{"since", "until", "group_by", "groups": [{key, n,
+        outcomes, queued_s, held_s, run_s, fetch_s, upload_s, wall_s, cost_usd: {total,
+        per_task, p50, p90}, affinity_hit_rate}]}`. `group_by` is kind (the server's
+        default) or gpu."""
+        return self._req("GET", "/v1/stats/tasks",
+                         params={"lane": lane, "pool": pool, "kind": kind,
+                                 "since": self._when(since), "until": self._when(until),
+                                 "group_by": group_by})
+
+    def spend_stats(self, *, lane: str = "", since=None, until=None,
+                    group_by: str = "") -> dict:
+        """`GET /v1/stats/spend`: `{"since", "until", "group_by", "rows": [{key, usd,
+        run_usd, park_usd, pod_hours}], "total_usd", "basis"}`. `group_by` is day (UTC; the
+        server's default), lane, gpu or pool. cost_hr x observed time, not an invoice."""
+        return self._req("GET", "/v1/stats/spend",
+                         params={"lane": lane, "since": self._when(since),
+                                 "until": self._when(until), "group_by": group_by})
+
+    # -- pod logs (APP-API §9) -----------------------------------------------------------
+
+    def request_logs(self, job_id: str, names: Optional[Iterable[str]] = None,
+                     lines: int = 200) -> dict:
+        """Ask the job's pod for its logs (pod-control never connects into a pod: the
+        request rides the pod's next heartbeat reply, and waits at most 10 min).
+        `names` None = every log the pod keeps; `lines` 1-2000. Replaces any request
+        still pending. `{"job_id", "req_id", "names", "lines", "expires_at"}`; Conflict for
+        a job that has ended."""
+        body: dict = {"lines": int(lines)}
+        if names is not None:
+            if isinstance(names, str):
+                names = [names]
+            body["names"] = list(names)
+        return self._req("POST", f"/v1/jobs/{self._id(job_id)}/logs/request", json=body)
+
+    def logs(self, job_id: str, name: Optional[str] = None) -> dict:
+        """The latest tail the pod pushed, per log name: `{"job_id", "logs": [{"name",
+        "at", "lines", "truncated"}], "pending"}` (`pending`: a request is still waiting
+        for the pod)."""
+        return self._req("GET", f"/v1/jobs/{self._id(job_id)}/logs",
+                         params={"name": name})
+
+    def log_download_url(self, job_id: str, name: str) -> str:
+        """A presigned GET for a full log the pod uploaded at its end (gzip). NotFound
+        when it never uploaded that name, or no log store is configured."""
+        if not name:
+            raise ValueError("name required")
+        out = self._req("GET", f"/v1/jobs/{self._id(job_id)}/logs/"
+                               f"{quote(name, safe='')}/download")
+        return out["url"]
